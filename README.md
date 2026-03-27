@@ -1,2 +1,2 @@
-# HumanAction-Platform 人体运动生成平台（NJUST2024科研训练项目—）
+# HumanAction-Platform 人体运动生成平台（NJUST2024科研训练项目）
 本项目是基于InterGen与lodge开源模型完成的多模态驱动的人体运动生成平台
