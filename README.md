@@ -6,5 +6,5 @@
 - LODGE模型：[点击查看LODGE模型](https://li-ronghui.github.io/lodge)
 
 ## 2. 前端文件
-- 前端文件采用vue语言编写，文档见"project/BACKEND_CALL_GUIDE.md"
-- 前端页面文件见"project/src/App.vue"
+- 前端文件采用vue语言编写，文档见("project/BACKEND_CALL_GUIDE.md")
+- 前端页面文件见("project/src/App.vue")
