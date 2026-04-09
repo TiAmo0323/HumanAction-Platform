@@ -1,164 +1,202 @@
-# 舞蹈生成后端调用说明
+# 后端调用说明（与当前项目代码一致）
 
-本文档用于对接当前前端页面（`src/App.vue`）的后端接口。
+本文档基于当前代码实现整理，覆盖前端 `project/src/App.vue` 正在实际调用的后端接口。
 
-## 1. 功能范围
+## 1. 当前架构
 
-前端当前支持 3 种生成模式：
+前端通过两个后端服务完成生成：
 
-- `text`：文字生成舞蹈
-- `voice`：语音输入/上传语音文件生成舞蹈
-- `music`：上传音乐文件生成舞蹈
+- InterGen API（默认 `http://127.0.0.1:8001`）
+  - 负责文本驱动的人体动作生成。
+- LODGE API（默认 `http://127.0.0.1:8002`）
+  - 负责音乐/特征驱动推理和渲染。
 
-支持分辨率：
+前端环境变量（Vite）：
 
-- `720p`
-- `1080p`
-- `2k`
+- `VITE_INTERGEN_API_BASE`：InterGen 基地址，默认 `http://127.0.0.1:8001`
+- `VITE_LODGE_API_BASE`：LODGE 基地址，默认 `http://127.0.0.1:8002`
+- `VITE_LODGE_PYTHON_EXECUTABLE`：可选，传给 LODGE 的 `python_executable`
 
-## 2. 推荐接口设计
+## 2. 前端输入模式与真实行为
 
-### 2.1 创建生成任务
+- `text`：可用，调用 InterGen。
+- `music`：可用，调用 LODGE（上传 `mp3/mp4/wav/npy`）。
+- `voice`：UI 可切换，但提交时会提示“语音功能暂未开放”。
 
-`POST /api/v1/dance/generations`
+说明：
 
-#### Content-Type
+- 前端分辨率选项 `720p/1080p/2k` 目前只用于 UI 展示，未传入后端。
+- 文件上传后会强制切到 `music` 流程，避免落在 `voice` 模式导致无法提交。
 
-- `application/json`（text 模式）
-- `multipart/form-data`（voice/music 模式，含文件上传）
+## 3. InterGen API（文本生成）
 
-#### 请求参数
+### 3.1 提交任务
 
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| mode | string | 是 | `text` / `voice` / `music` |
-| resolution | string | 是 | `720p` / `1080p` / `2k` |
-| prompt | string | text 模式必填 | 文本提示词 |
-| file | file | voice/music 必填 | 音频文件（`audio/*`） |
-| saveName | string | 否 | 输出文件名建议，如 `scene-1080p.mp4` |
+`POST /v1/intergen/tasks/generate`
 
-#### 成功响应（202）
+请求体：
 
 ```json
 {
-  "jobId": "gen_20260328_001",
+  "text": "两个人相遇，握手后并排向前行走。"
+}
+```
+
+返回示例：
+
+```json
+{
+  "task_id": "f8f65cbf-7d1b-4bbd-b2f5-589f09b8e5f7",
   "status": "queued",
-  "progress": 0,
-  "message": "task accepted"
+  "created_at": "2026-03-27T12:00:00Z",
+  "updated_at": "2026-03-27T12:00:00Z",
+  "message": "Task queued",
+  "output_mp4_path": null,
+  "stderr_tail": ""
 }
 ```
 
----
+### 3.2 查询任务
 
-### 2.2 查询任务状态
+`GET /v1/intergen/tasks/{task_id}`
 
-`GET /api/v1/dance/generations/{jobId}`
-
-#### 成功响应（200）
-
-```json
-{
-  "jobId": "gen_20260328_001",
-  "status": "processing",
-  "progress": 65,
-  "previewUrl": "https://cdn.example.com/preview/gen_20260328_001.mp4",
-  "resultUrl": null,
-  "error": null
-}
-```
-
-`status` 建议枚举：
+状态枚举：
 
 - `queued`
-- `processing`
+- `running`
 - `succeeded`
 - `failed`
 
-当 `status = succeeded` 时，返回：
+### 3.3 下载视频
 
-- `progress: 100`
-- `resultUrl`：成品视频下载地址
+`GET /v1/intergen/tasks/{task_id}/download`
 
----
+返回 `video/mp4`。
 
-### 2.3 下载结果（可选）
+### 3.4 其他可用接口
 
-`GET /api/v1/dance/generations/{jobId}/download`
+- `GET /health`
+- `POST /translate`
 
-- 可直接 302 到对象存储地址
-- 或直接返回流（`video/mp4`）
+## 4. LODGE API（音乐/文件上传）
 
-## 3. 与当前前端字段映射
+前端当前实际调用的是上传类接口：
 
-前端状态字段（`src/App.vue`）与接口字段映射如下：
+- 音频文件（`mp3/mp4/wav`）：
+  - `POST /v1/lodge/tasks/infer-from-audio-upload`
+  - 表单字段：
+    - `lodge_root`（固定传 `D:/LODGE-main`）
+    - `song_id`（文件名去后缀）
+    - `audio_file`（上传文件）
+    - `python_executable`（可选，来自 `VITE_LODGE_PYTHON_EXECUTABLE`）
+    - `mode`（默认 `smplx`）
+    - `device`（默认 `0`）
+    - `fps`（默认 `30`）
+- 特征文件（`npy`）：
+  - `POST /v1/lodge/tasks/infer-from-feature-npy-upload`
+  - 字段与上面类似，文件字段为 `npy_file`
 
-- `inputMode` -> `mode`
-- `resolution` -> `resolution`
-- `prompt` -> `prompt`
-- 文件上传（`uploadFileInput`）-> `file`
+LODGE 任务对象包含 `progress` 字段（0-100），前端会优先使用该字段驱动进度条。
 
-前端当前进度条逻辑：
+### 4.1 查询任务
 
-- 提交时先显示 `50%`
-- 完成后变为 `100%`
+`GET /v1/lodge/tasks/{task_id}`
 
-建议升级为真实进度：
+### 4.2 下载视频
 
-1. 创建任务后拿到 `jobId`
-2. 每 1~2 秒轮询状态接口
-3. 用返回的 `progress` 驱动进度条
-4. `succeeded` 后展示/下载 `resultUrl`
+`GET /v1/lodge/tasks/{task_id}/download`
 
-## 4. 调用示例
+支持：
 
-### 4.1 text 模式
+- 在线播放（默认 `inline`）
+- 下载（`?as_attachment=true`）
+- Range 请求（断点/分段播放）
+
+### 4.3 打开本机播放器与输出目录（前端已接入）
+
+- `POST /v1/lodge/tasks/{task_id}/open-output-player`
+- `POST /v1/lodge/tasks/{task_id}/open-output-folder`
+
+说明：这两个接口会在后端机器上执行系统命令打开播放器/文件夹，适合本机部署联调场景。
+
+### 4.4 LODGE 其他可用接口（当前前端未直接调用）
+
+- `POST /v1/lodge/tasks/render-song`
+- `POST /v1/lodge/tasks/infer-and-render`
+- `POST /v1/lodge/tasks/infer-from-audio`
+- `POST /v1/lodge/tasks/render-from-npy-upload`
+- `GET /health`
+
+## 5. 前端轮询与进度逻辑
+
+前端提交任务后每 5 秒轮询一次状态接口。
+
+规则如下：
+
+1. 提交后先显示 `10%`。
+2. 若状态返回里有数值型 `progress`，直接使用。
+3. 若没有 `progress`（如 InterGen 当前返回结构），前端会模拟进度（未完成前每轮 +5，最高到 95）。
+4. `status = succeeded` 时置 `100%` 并展示视频。
+5. `status = failed` 时归零并提示 `message`。
+
+## 6. 联调顺序建议
+
+1. 启动 InterGen API（默认 8001）。
+2. 启动 LODGE API（默认 8002）。
+3. 启动前端：`npm run dev`。
+4. 文本模式验证 InterGen。
+5. 上传 `mp3/mp4/wav/npy` 验证 LODGE。
+
+## 7. 调用示例（可直接用）
+
+### 7.1 InterGen 文本任务
 
 ```bash
-curl -X POST "http://localhost:8080/api/v1/dance/generations" \
+curl -X POST "http://127.0.0.1:8001/v1/intergen/tasks/generate" \
   -H "Content-Type: application/json" \
-  -d "{\"mode\":\"text\",\"resolution\":\"1080p\",\"prompt\":\"国风双人舞，慢镜头，舞台追光\"}"
+  -d "{\"text\":\"两个人相遇，握手后并排向前行走。\"}"
 ```
-
-### 4.2 voice 模式
 
 ```bash
-curl -X POST "http://localhost:8080/api/v1/dance/generations" \
-  -F "mode=voice" \
-  -F "resolution=1080p" \
-  -F "file=@voice-demo.wav"
+curl "http://127.0.0.1:8001/v1/intergen/tasks/<task_id>"
 ```
 
-### 4.3 music 模式
+### 7.2 LODGE 音频上传任务
 
 ```bash
-curl -X POST "http://localhost:8080/api/v1/dance/generations" \
-  -F "mode=music" \
-  -F "resolution=2k" \
-  -F "file=@music-demo.mp3"
+curl -X POST "http://127.0.0.1:8002/v1/lodge/tasks/infer-from-audio-upload" \
+  -F "lodge_root=D:/LODGE-main" \
+  -F "song_id=demo001" \
+  -F "mode=smplx" \
+  -F "device=0" \
+  -F "fps=30" \
+  -F "audio_file=@demo001.mp3"
 ```
 
-### 4.4 查询进度
+### 7.3 LODGE 特征 npy 上传任务
 
 ```bash
-curl "http://localhost:8080/api/v1/dance/generations/gen_20260328_001"
+curl -X POST "http://127.0.0.1:8002/v1/lodge/tasks/infer-from-feature-npy-upload" \
+  -F "lodge_root=D:/LODGE-main" \
+  -F "song_id=demo002" \
+  -F "mode=smplx" \
+  -F "device=0" \
+  -F "fps=30" \
+  -F "npy_file=@demo002.npy"
 ```
 
-## 5. 错误码建议
+### 7.4 查询与下载
 
-| HTTP Code | 场景 | 建议 message |
-|---|---|---|
-| 400 | 参数缺失/非法 | invalid request |
-| 413 | 文件过大 | file too large |
-| 415 | 文件类型不支持 | unsupported media type |
-| 422 | 模式与参数不匹配 | mode and payload mismatch |
-| 500 | 服务内部错误 | internal error |
-| 503 | 生成服务繁忙 | service unavailable |
+```bash
+curl "http://127.0.0.1:8002/v1/lodge/tasks/<task_id>"
+```
 
-## 6. 最低落地建议
+```bash
+curl -L -o result.mp4 "http://127.0.0.1:8002/v1/lodge/tasks/<task_id>/download?as_attachment=true"
+```
 
-后端最少先实现这 2 个接口即可完成联调：
+## 8. 常见问题
 
-1. `POST /api/v1/dance/generations`
-2. `GET /api/v1/dance/generations/{jobId}`
-
-这样前端就能完成：提交任务 -> 显示进度 -> 获取结果。
+- 任务 404：后端重启后内存任务会丢失，需要重新提交。
+- InterGen 无真实进度：当前返回结构无 `progress` 字段，前端会自动走模拟进度。
+- 播放器/文件夹打不开：通常是后端进程无桌面权限或非本机部署，改用下载接口即可。
