@@ -8,3 +8,7 @@
 ## 2. 前端文件
 - 前端文件采用vue语言编写，文档见 `project/BACKEND_CALL_GUIDE.md`
 - 前端页面文件见 `project/src/App.vue`
+
+## 3. 后端文件
+- 后端文件为`intergen_async_api.py` 和 `lodge_async_api.py`
+- 本地运行时请先启动两个api文件，再启动前端vue文件
