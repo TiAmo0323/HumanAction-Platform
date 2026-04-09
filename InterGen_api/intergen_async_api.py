@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # Keep runtime stable on Windows scientific stacks.
@@ -30,6 +31,52 @@ PROJECT_ROOT = APP_ROOT.parent
 DEFAULT_TASK_ROOT = APP_ROOT / "task_runs"
 DEFAULT_TASK_ROOT.mkdir(parents=True, exist_ok=True)
 
+
+def _looks_like_intergen_root(path: Path) -> bool:
+    return (
+        (path / "configs" / "model.yaml").exists()
+        and (path / "configs" / "infer.yaml").exists()
+        and (path / "models").exists()
+        and (path / "utils" / "human_mesh_renderer_fast.py").exists()
+        and (path / "utils" / "human_mesh_renderer.py").exists()
+        and (path / "utils" / "human_model_paths.py").exists()
+    )
+
+
+def _detect_source_root() -> str:
+    candidates = [
+        PROJECT_ROOT,
+        Path(os.getenv("INTERGEN_SOURCE_ROOT_DEFAULT", "")).expanduser() if os.getenv("INTERGEN_SOURCE_ROOT_DEFAULT") else None,
+        Path("D:/InterGen/InterGen_master"),
+        Path("D:/InterGen"),
+    ]
+    for c in candidates:
+        if c is None:
+            continue
+        c = c.resolve()
+        if _looks_like_intergen_root(c):
+            return str(c)
+    return ""
+
+# Optional external source root that contains InterGen package folders like
+# configs/, models/, and utils/. Useful when API code is separated from model code.
+INTERGEN_SOURCE_ROOT = os.getenv("INTERGEN_SOURCE_ROOT", "").strip()
+if not INTERGEN_SOURCE_ROOT:
+    INTERGEN_SOURCE_ROOT = _detect_source_root()
+if INTERGEN_SOURCE_ROOT:
+    _source_root_path = Path(INTERGEN_SOURCE_ROOT).expanduser().resolve()
+    if _source_root_path.exists() and str(_source_root_path) not in sys.path:
+        sys.path.insert(0, str(_source_root_path))
+
+# Optional external config directory. If provided, its parent is treated as the
+# source root so `from configs import ...` remains importable.
+INTERGEN_CONFIG_DIR = os.getenv("INTERGEN_CONFIG_DIR", "").strip()
+if INTERGEN_CONFIG_DIR:
+    _config_dir_path = Path(INTERGEN_CONFIG_DIR).expanduser().resolve()
+    _config_parent = _config_dir_path.parent
+    if _config_parent.exists() and str(_config_parent) not in sys.path:
+        sys.path.insert(0, str(_config_parent))
+
 # Ensure project modules are importable when running from this folder.
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -40,10 +87,25 @@ from os.path import join as pjoin
 from configs import get_config
 from models import InterGen
 from utils import paramUtil
-from utils.human_mesh_renderer_fast import render_two_person_smpl_video_pyrender as render_two_person_smpl_video
+from utils.human_mesh_renderer_fast import render_two_person_smpl_video_pyrender as render_two_person_smpl_video_fast
 from utils.human_model_paths import get_human_models_root, validate_human_models
 from utils.plot_script import plot_3d_motion
-from utils.preprocess import MotionNormalizer
+import utils.human_mesh_renderer_fast as _human_mesh_renderer_fast
+import utils.human_mesh_renderer as _human_mesh_renderer
+import utils.human_model_paths as _human_model_paths
+try:
+    from utils.utils import MotionNormalizer
+except Exception:
+    from utils.preprocess import MotionNormalizer
+
+try:
+    import configs as _configs_pkg
+
+    CONFIGS_ROOT = Path(_configs_pkg.__file__).resolve().parent
+    MODEL_SOURCE_ROOT = CONFIGS_ROOT.parent
+except Exception:
+    CONFIGS_ROOT = PROJECT_ROOT / "configs"
+    MODEL_SOURCE_ROOT = PROJECT_ROOT
 
 
 class GenerateMotionRequest(BaseModel):
@@ -101,15 +163,69 @@ class LitGenModel(L.LightningModule):
         motion_output = self.generate_loop(batch, window_size)
 
         render_mode = os.getenv("INTERGEN_RENDER_MODE", "smpl").strip().lower()
-        fps = int(os.getenv("INTERGEN_FPS", "24"))
-        num_fit_iters = int(os.getenv("INTERGEN_SMPL_ITERS", "120"))
-        max_render_frames = int(os.getenv("INTERGEN_MAX_RENDER_FRAMES", "168"))
         body_model_type = os.getenv("INTERGEN_BODY_MODEL", "smplx").strip().lower()
+        profile_name = os.getenv("INTERGEN_RENDER_PROFILE", "balanced")
+        defaults = _render_profile_defaults(profile_name)
+
+        fps = int(os.getenv("INTERGEN_FPS", str(defaults["fps"])))
+        num_fit_iters = int(os.getenv("INTERGEN_SMPL_ITERS", str(defaults["iters"])))
+        max_render_frames = int(os.getenv("INTERGEN_MAX_RENDER_FRAMES", str(defaults["max_frames"])))
+        camera_elev = float(os.getenv("INTERGEN_CAMERA_ELEV", str(defaults["camera_elev"])))
+        camera_azim_env = os.getenv("INTERGEN_CAMERA_AZIM", str(defaults["camera_azim"]))
+        camera_azim = None if camera_azim_env in (None, "", "auto", "AUTO") else float(camera_azim_env)
+        camera_azim_offset = float(os.getenv("INTERGEN_CAMERA_AZIM_OFFSET", str(defaults["camera_azim_offset"])))
+        camera_orbit_speed = float(os.getenv("INTERGEN_CAMERA_ORBIT_SPEED", str(defaults["camera_orbit_speed"])))
+        render_size = _parse_render_size(
+            os.getenv("INTERGEN_RENDER_SIZE", f"{defaults['size'][0]}x{defaults['size'][1]}"),
+            default=defaults["size"],
+        )
+        ffmpeg_preset = os.getenv("INTERGEN_FFMPEG_PRESET", defaults["ffmpeg_preset"])
+        ffmpeg_crf = int(os.getenv("INTERGEN_FFMPEG_CRF", str(defaults["ffmpeg_crf"])))
+        dynamic_lighting = os.getenv("INTERGEN_DYNAMIC_LIGHTING", "1" if defaults["dynamic_lighting"] else "0").strip() == "1"
+        align_with_stickman_axes = os.getenv(
+            "INTERGEN_ALIGN_WITH_STICKMAN_AXES",
+            "1" if defaults["align_with_stickman_axes"] else "0",
+        ).strip() == "1"
+        vertex_smooth_sigma = float(os.getenv("INTERGEN_VERTEX_SMOOTH_SIGMA", str(defaults["vertex_smooth_sigma"])))
+        vertex_median_window = int(os.getenv("INTERGEN_VERTEX_MEDIAN_WINDOW", str(defaults["vertex_median_window"])))
+        vertex_spike_z_thresh = float(os.getenv("INTERGEN_VERTEX_SPIKE_Z_THRESH", str(defaults["vertex_spike_z_thresh"])))
+        target_duration_sec = float(os.getenv("INTERGEN_TARGET_DURATION_SEC", str(defaults["target_duration_sec"])))
+        min_duration_sec = max(6.0, float(os.getenv("INTERGEN_MIN_DURATION_SEC", str(defaults["min_duration_sec"]))))
+        fit_early_stop_patience = int(os.getenv("INTERGEN_FIT_EARLY_STOP_PATIENCE", str(defaults["fit_early_stop_patience"])))
+        fit_early_stop_check_every = int(os.getenv("INTERGEN_FIT_EARLY_STOP_CHECK_EVERY", str(defaults["fit_early_stop_check_every"])))
+        fit_early_stop_rel_tol = float(os.getenv("INTERGEN_FIT_EARLY_STOP_REL_TOL", str(defaults["fit_early_stop_rel_tol"])))
+
+        fps = _clamp_int(fps, 15, 30)
+        camera_elev = _clamp_float(camera_elev, 0.0, 89.0)
+        camera_azim_offset = _clamp_float(camera_azim_offset, -180.0, 180.0)
+        camera_orbit_speed = _clamp_float(camera_orbit_speed, 0.0, 0.2)
+        target_duration_sec = _clamp_float(target_duration_sec, 6.0, 20.0)
+        min_duration_sec = _clamp_float(min_duration_sec, 6.0, 20.0)
+        vertex_median_window = _clamp_int(vertex_median_window, 1, 9)
+        vertex_spike_z_thresh = _clamp_float(vertex_spike_z_thresh, 2.0, 10.0)
+        if vertex_median_window % 2 == 0:
+            vertex_median_window += 1
+
+        force_stickman_axes = os.getenv("INTERGEN_FORCE_STICKMAN_AXES")
+        if force_stickman_axes is not None:
+            align_with_stickman_axes = force_stickman_axes.strip() == "1"
+
+        print(f"[Render] mode={render_mode}")
+        print("[Render] backend=fast")
+        print(f"[Render] body_model={body_model_type}")
+        print(f"[Render] profile={profile_name}")
+        print(f"[Render] device={run_device}")
+        print(
+            "[Render] effective "
+            f"fps={fps}, dur_target={target_duration_sec:.2f}, dur_min={min_duration_sec:.2f}, "
+            f"cam_elev={camera_elev:.1f}, cam_azim={('auto-front' if camera_azim is None else f'{camera_azim:.1f}')}, cam_azim_offset={camera_azim_offset:.1f}, stickman_axes={int(align_with_stickman_axes)}, "
+            f"median_w={vertex_median_window}, sigma={vertex_smooth_sigma:.2f}, spike_z={vertex_spike_z_thresh:.2f}"
+        )
 
         if render_mode == "smpl":
-            human_models_root = get_human_models_root(str(PROJECT_ROOT))
+            human_models_root = _resolve_human_models_root()
             try:
-                render_two_person_smpl_video(
+                render_two_person_smpl_video_fast(
                     joints_a_22=motion_output[0],
                     joints_b_22=motion_output[1],
                     result_path=output_path,
@@ -120,6 +236,23 @@ class LitGenModel(L.LightningModule):
                     device=run_device,
                     body_model_type=body_model_type,
                     max_render_frames=max_render_frames,
+                    camera_elev=camera_elev,
+                    camera_azim=camera_azim,
+                    camera_azim_offset=camera_azim_offset,
+                    camera_orbit_speed=camera_orbit_speed,
+                    render_size=render_size,
+                    ffmpeg_preset=ffmpeg_preset,
+                    ffmpeg_crf=ffmpeg_crf,
+                    dynamic_lighting=dynamic_lighting,
+                    align_with_stickman_axes=align_with_stickman_axes,
+                    vertex_smooth_sigma=vertex_smooth_sigma,
+                    vertex_median_window=vertex_median_window,
+                    vertex_spike_z_thresh=vertex_spike_z_thresh,
+                    target_duration_sec=target_duration_sec,
+                    min_duration_sec=min_duration_sec,
+                    fit_early_stop_patience=fit_early_stop_patience,
+                    fit_early_stop_check_every=fit_early_stop_check_every,
+                    fit_early_stop_rel_tol=fit_early_stop_rel_tol,
                 )
                 return {
                     "render_mode": "smpl",
@@ -127,6 +260,9 @@ class LitGenModel(L.LightningModule):
                     "fallback_used": "0",
                 }
             except Exception as exc:
+                strict_mode = os.getenv("INTERGEN_SMPL_STRICT", "0").strip() == "1"
+                if strict_mode:
+                    raise
                 self.plot_t2m([motion_output[0], motion_output[1]], output_path, batch["prompt"])
                 return {
                     "render_mode": "skeleton",
@@ -173,6 +309,100 @@ def _resolve_runtime_device(preferred: str = "cuda:0") -> torch.device:
     return torch.device("cpu")
 
 
+def _parse_render_size(env_value: str, default=(960, 960)):
+    value = (env_value or "").lower().strip()
+    if "x" not in value:
+        return default
+    try:
+        w_str, h_str = value.split("x", 1)
+        width = max(320, int(w_str))
+        height = max(320, int(h_str))
+        return (width, height)
+    except Exception:
+        return default
+
+
+def _render_profile_defaults(profile_name: str) -> dict:
+    profile = (profile_name or "balanced").strip().lower()
+    presets = {
+        "fast": {
+            "fps": 22,
+            "iters": 60,
+            "max_frames": 140,
+            "size": (960, 960),
+            "ffmpeg_preset": "ultrafast",
+            "ffmpeg_crf": 22,
+            "camera_elev": 18.0,
+            "camera_azim": "auto",
+            "camera_orbit_speed": 0.0,
+            "camera_azim_offset": 0.0,
+            "dynamic_lighting": False,
+            "align_with_stickman_axes": True,
+            "vertex_smooth_sigma": 0.6,
+            "vertex_median_window": 3,
+            "vertex_spike_z_thresh": 4.0,
+            "target_duration_sec": 7.0,
+            "min_duration_sec": 6.0,
+            "fit_early_stop_patience": 5,
+            "fit_early_stop_check_every": 5,
+            "fit_early_stop_rel_tol": 2.0e-4,
+        },
+        "balanced": {
+            "fps": 24,
+            "iters": 120,
+            "max_frames": 168,
+            "size": (1280, 1280),
+            "ffmpeg_preset": "veryfast",
+            "ffmpeg_crf": 18,
+            "camera_elev": 18.0,
+            "camera_azim": "auto",
+            "camera_orbit_speed": 0.0,
+            "camera_azim_offset": 0.0,
+            "dynamic_lighting": False,
+            "align_with_stickman_axes": True,
+            "vertex_smooth_sigma": 1.0,
+            "vertex_median_window": 5,
+            "vertex_spike_z_thresh": 3.0,
+            "target_duration_sec": 7.0,
+            "min_duration_sec": 6.0,
+            "fit_early_stop_patience": 6,
+            "fit_early_stop_check_every": 5,
+            "fit_early_stop_rel_tol": 1.5e-4,
+        },
+        "quality": {
+            "fps": 30,
+            "iters": 200,
+            "max_frames": 210,
+            "size": (1440, 1440),
+            "ffmpeg_preset": "medium",
+            "ffmpeg_crf": 15,
+            "camera_elev": 18.0,
+            "camera_azim": "auto",
+            "camera_orbit_speed": 0.0,
+            "camera_azim_offset": 0.0,
+            "dynamic_lighting": True,
+            "align_with_stickman_axes": True,
+            "vertex_smooth_sigma": 1.2,
+            "vertex_median_window": 7,
+            "vertex_spike_z_thresh": 3.0,
+            "target_duration_sec": 7.0,
+            "min_duration_sec": 6.0,
+            "fit_early_stop_patience": 8,
+            "fit_early_stop_check_every": 5,
+            "fit_early_stop_rel_tol": 1.0e-4,
+        },
+    }
+    return presets.get(profile, presets["balanced"])
+
+
+def _clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(x)))
+
+
+def _clamp_float(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(x)))
+
+
 def _build_model(model_cfg):
     if model_cfg.NAME != "InterGen":
         raise ValueError(f"Unsupported model config NAME: {model_cfg.NAME}")
@@ -189,26 +419,60 @@ def _tail_text(text: str, max_chars: int = 6000) -> str:
     return text[-max_chars:]
 
 
+def _resolve_human_models_root() -> str:
+    # Priority: explicit env > model source root > API project root.
+    env_root = os.getenv("INTERGEN_HUMAN_MODELS_ROOT", "").strip()
+    if env_root:
+        return str(Path(env_root).expanduser().resolve())
+
+    source_default = MODEL_SOURCE_ROOT / "human_models"
+    if source_default.exists():
+        return str(source_default)
+
+    return get_human_models_root(str(PROJECT_ROOT))
+
+
 class InterGenService:
     def __init__(self):
         self._model = None
         self._infer_lock = threading.Lock()
 
     def load(self):
-        human_models_root = get_human_models_root(str(PROJECT_ROOT))
+        human_models_root = _resolve_human_models_root()
         status = validate_human_models(human_models_root)
         print("Human model assets:")
         print(f"  root: {status['human_models_root']}")
         print(f"  exists: {status['exists']}")
         print(f"  smpl_ready: {status['smpl_ready']}")
         print(f"  smplx_ready: {status['smplx_ready']}")
+        print(f"  render_mode(default): {os.getenv('INTERGEN_RENDER_MODE', 'smpl')}")
+        print("Code source resolution:")
+        print(f"  INTERGEN_SOURCE_ROOT: {INTERGEN_SOURCE_ROOT or '(auto-not-found)'}")
+        print(f"  CONFIGS_ROOT: {config_dir if 'config_dir' in locals() else '(unresolved)'}")
+        print(f"  human_mesh_renderer_fast: {Path(_human_mesh_renderer_fast.__file__).resolve()}")
+        print(f"  human_mesh_renderer: {Path(_human_mesh_renderer.__file__).resolve()}")
+        print(f"  human_model_paths: {Path(_human_model_paths.__file__).resolve()}")
+        if not status["smpl_ready"] and not status["smplx_ready"]:
+            print("  note: SMPL assets unavailable, rendering may fall back to skeleton mode.")
 
-        model_cfg = get_config(str(PROJECT_ROOT / "configs" / "model.yaml"))
-        infer_cfg = get_config(str(PROJECT_ROOT / "configs" / "infer.yaml"))
+        config_dir_env = os.getenv("INTERGEN_CONFIG_DIR", "").strip()
+        config_dir = Path(config_dir_env).expanduser().resolve() if config_dir_env else CONFIGS_ROOT
+        model_yaml = config_dir / "model.yaml"
+        infer_yaml = config_dir / "infer.yaml"
+        if not model_yaml.exists() or not infer_yaml.exists():
+            raise FileNotFoundError(
+                f"InterGen config files not found under: {config_dir}. "
+                "Set INTERGEN_CONFIG_DIR to a directory that contains model.yaml and infer.yaml."
+            )
+
+        model_cfg = get_config(str(model_yaml))
+        infer_cfg = get_config(str(infer_yaml))
 
         model = _build_model(model_cfg)
         if model_cfg.CHECKPOINT:
-            ckpt_path = Path(model_cfg.CHECKPOINT)
+            ckpt_path = Path(model_cfg.CHECKPOINT).expanduser()
+            if not ckpt_path.is_absolute():
+                ckpt_path = MODEL_SOURCE_ROOT / ckpt_path
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
             ckpt = torch.load(str(ckpt_path), map_location="cpu")
@@ -234,6 +498,14 @@ class InterGenService:
 
 
 app = FastAPI(title="InterGen Async API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 executor = ThreadPoolExecutor(max_workers=1)
 service = InterGenService()
 _tasks: Dict[str, TaskInfo] = {}
@@ -245,7 +517,10 @@ def _update_task(task_id: str, **kwargs) -> None:
         task = _tasks.get(task_id)
         if task is None:
             return
-        data = task.model_dump()
+        if hasattr(task, "model_dump"):
+            data = task.model_dump()
+        else:
+            data = task.dict()
         data.update(kwargs)
         data["updated_at"] = _utc_now()
         _tasks[task_id] = TaskInfo(**data)
