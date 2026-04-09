@@ -1,171 +1,181 @@
 # LODGE Async API
 
-This service wraps LODGE rendering as an asynchronous HTTP API, so backend and model code can live in different directories or machines.
+This API wraps LODGE inference and rendering into asynchronous HTTP tasks.
 
 ## 1. Install
 
-```bash
-pip install -r api/requirements.txt
-```
+Run in this folder:
+
+    pip install -r requirements.txt
 
 ## 2. Run
 
-```bash
-uvicorn api.lodge_async_api:app --host 0.0.0.0 --port 8001
-```
+Option A (direct):
 
-## 3. API Flow
+    python lodge_async_api.py
 
-1. Submit render task
-2. Poll task status
-3. Download mp4 when task succeeded
+Option B (uvicorn):
 
-You can also submit a full infer+render task in one call.
+    uvicorn lodge_async_api:app --host 0.0.0.0 --port 8002
 
-### 3.1 Submit Task
+Default port in current code is 8002.
 
-`POST /v1/lodge/tasks/render-song`
+## 3. Endpoint List
 
-Request body example:
+- GET /health
+- POST /v1/lodge/tasks/render-song
+- POST /v1/lodge/tasks/infer-and-render
+- POST /v1/lodge/tasks/infer-from-audio
+- POST /v1/lodge/tasks/infer-from-audio-upload
+- POST /v1/lodge/tasks/render-from-npy-upload
+- POST /v1/lodge/tasks/infer-from-feature-npy-upload
+- GET /v1/lodge/tasks/{task_id}
+- GET /v1/lodge/tasks/{task_id}/download
+- POST /v1/lodge/tasks/{task_id}/open-output-folder
+- POST /v1/lodge/tasks/{task_id}/open-output-player
 
-```json
-{
-  "lodge_root": "D:/LODGE-main",
-  "sample_dir": "D:/LODGE-main/experiments/Local_Module/FineDance_FineTuneV2_Local/samples_dod_2999_299_inpaint_soft_ddim_notranscontrol_2026-03-18-23-59-44",
-  "song_id": "132",
-  "python_executable": "D:/anaconda3/envs/lodge/python.exe",
-  "mode": "smplx",
-  "device": "0",
-  "fps": 30
-}
-```
+Task status values:
 
-### 3.1.1 Submit Infer + Render Task
+- queued
+- running
+- succeeded
+- failed
 
-`POST /v1/lodge/tasks/infer-and-render`
+## 4. Core Workflows
 
-Request body example:
+### 4.1 Render from existing samples
 
-```json
-{
-  "lodge_root": "D:/LODGE-main",
-  "song_id": "132",
-  "python_executable": "D:/anaconda3/envs/lodge/python.exe",
-  "infer_args": ["--soft", "1.0"],
-  "mode": "smplx",
-  "device": "0",
-  "fps": 30
-}
-```
+POST /v1/lodge/tasks/render-song
 
-Optional field: `sample_dir_hint`. If provided, rendering uses that specific samples directory; otherwise the latest `samples_dod_*` under `experiments` is auto-detected.
+JSON body example:
 
-### 3.2 Query Task
+    {
+      "lodge_root": "D:/LODGE-main",
+      "sample_dir": "D:/LODGE-main/experiments/.../samples_dod_xxx",
+      "song_id": "132",
+      "python_executable": "D:/anaconda3/envs/lodge/python.exe",
+      "mode": "smplx",
+      "device": "0",
+      "fps": 30
+    }
 
-`GET /v1/lodge/tasks/{task_id}`
+### 4.2 Infer + render in one call
 
-Task statuses: `queued`, `running`, `succeeded`, `failed`.
+POST /v1/lodge/tasks/infer-and-render
 
-### 3.3 Download MP4
+JSON body example:
 
-`GET /v1/lodge/tasks/{task_id}/download`
+    {
+      "lodge_root": "D:/LODGE-main",
+      "song_id": "132",
+      "python_executable": "D:/anaconda3/envs/lodge/python.exe",
+      "infer_args": ["--soft", "1.0"],
+      "mode": "smplx",
+      "device": "0",
+      "fps": 30
+    }
 
-Returns `video/mp4` file stream.
+Optional field:
 
-## 4. Notes
+- sample_dir_hint: force using a specific samples_dod directory.
 
-- This API currently wraps `render.py` for a given `song_id` from `sample_dir/concat/npy/{song_id}.npy`.
-- Infer endpoint runs existing `infer_lodge.py` as-is, then renders one song id.
-- It does not modify existing LODGE inference code.
-- In-memory task state will be lost if the API process restarts.
+### 4.3 Audio upload -> infer -> render
+
+POST /v1/lodge/tasks/infer-from-audio-upload
+
+multipart/form-data fields:
+
+- lodge_root (required)
+- song_id (required)
+- audio_file (required)
+- python_executable (optional)
+- mode (optional, default smplx)
+- device (optional, default 0)
+- fps (optional, default 30)
+- infer_args (optional, comma-separated string)
+
+Supported uploaded audio/video formats are converted internally to wav when needed.
+
+### 4.4 Feature npy upload -> infer -> render
+
+POST /v1/lodge/tasks/infer-from-feature-npy-upload
+
+multipart/form-data fields are similar to audio upload, with npy_file as the file field.
+
+## 5. Query and Download
+
+Query task:
+
+    GET /v1/lodge/tasks/{task_id}
+
+Task response includes progress (0-100), message, output_mp4_path, stdout_tail, stderr_tail.
+
+Download result mp4:
+
+    GET /v1/lodge/tasks/{task_id}/download
+
+Supports:
+
+- inline playback (default)
+- attachment download with as_attachment=true
+- HTTP Range requests
+
+## 6. Desktop Helper Endpoints
+
+For local deployment on the same machine:
+
+- POST /v1/lodge/tasks/{task_id}/open-output-folder
+- POST /v1/lodge/tasks/{task_id}/open-output-player
+
+These endpoints open the output folder or mp4 using the backend host OS.
+
+## 7. Notes
+
+- The API wraps existing infer_lodge.py and render.py behavior.
+- Task state is kept in memory and will be lost after API restart.
+- Outputs are stored under LODGE_api/task_runs/{task_id}/.
 
 ---
 
 ## 中文说明
 
-该服务将 LODGE 推理/渲染能力封装为异步 HTTP API，适合后端工程与模型工程分离部署的场景。
+该服务将 LODGE 推理与渲染封装为异步任务 API，适合前后端分离和本机联调。
 
-### 1. 安装依赖
+### 1. 安装
 
-```bash
-pip install -r api/requirements.txt
-```
+在当前目录执行：
 
-### 2. 启动服务
+    pip install -r requirements.txt
 
-```bash
-uvicorn api.lodge_async_api:app --host 0.0.0.0 --port 8001
-```
+### 2. 启动
 
-### 3. 接口调用流程
+方式一：
 
-1. 提交异步任务
-2. 轮询任务状态
-3. 任务成功后下载 MP4
+    python lodge_async_api.py
 
-### 3.1 提交渲染任务（已有 samples 目录）
+方式二：
 
-`POST /v1/lodge/tasks/render-song`
+    uvicorn lodge_async_api:app --host 0.0.0.0 --port 8002
 
-请求体示例：
+当前代码默认端口为 8002。
 
-```json
-{
-  "lodge_root": "D:/LODGE-main",
-  "sample_dir": "D:/LODGE-main/experiments/Local_Module/FineDance_FineTuneV2_Local/samples_dod_2999_299_inpaint_soft_ddim_notranscontrol_2026-03-18-23-59-44",
-  "song_id": "132",
-  "python_executable": "D:/anaconda3/envs/lodge/python.exe",
-  "mode": "smplx",
-  "device": "0",
-  "fps": 30
-}
-```
+### 3. 主要接口
 
-参数说明：
+- 健康检查：GET /health
+- 任务创建：见上方 Endpoint List
+- 查询任务：GET /v1/lodge/tasks/{task_id}
+- 下载视频：GET /v1/lodge/tasks/{task_id}/download
+- 打开目录：POST /v1/lodge/tasks/{task_id}/open-output-folder
+- 打开播放器：POST /v1/lodge/tasks/{task_id}/open-output-player
 
-- `lodge_root`: LODGE 项目根目录。
-- `sample_dir`: 已生成结果目录，要求包含 `concat/npy/{song_id}.npy`。
-- `song_id`: 目标歌曲编号（如 `132`）。
-- `python_executable`: LODGE conda 环境中的 Python 路径。
-- `mode`: 渲染模式，可选 `smpl` / `smplh` / `smplx`。
-- `device`: GPU 设备号字符串。
-- `fps`: 输出视频帧率。
+### 4. 常用联调建议
 
-### 3.1.1 提交推理+渲染一体化任务
+1. 先调用创建任务接口，获取 task_id。
+2. 轮询查询接口直到 status=succeeded 或 failed。
+3. 成功后调用下载接口获取 mp4。
 
-`POST /v1/lodge/tasks/infer-and-render`
+### 5. 备注
 
-请求体示例：
-
-```json
-{
-  "lodge_root": "D:/LODGE-main",
-  "song_id": "132",
-  "python_executable": "D:/anaconda3/envs/lodge/python.exe",
-  "infer_args": ["--soft", "1.0"],
-  "mode": "smplx",
-  "device": "0",
-  "fps": 30
-}
-```
-
-可选字段：`sample_dir_hint`。
-如果提供该字段，渲染会优先使用该 samples 目录；如果不提供，则自动从 `experiments` 下选择最新的 `samples_dod_*` 目录。
-
-### 3.2 查询任务状态
-
-`GET /v1/lodge/tasks/{task_id}`
-
-任务状态包括：`queued`、`running`、`succeeded`、`failed`。
-
-### 3.3 下载结果视频
-
-`GET /v1/lodge/tasks/{task_id}/download`
-
-返回 `video/mp4` 文件流，后端可直接落盘保存。
-
-### 4. 备注
-
-- 当前封装基于现有 `render.py` 与 `infer_lodge.py`，不改动模型原始推理逻辑。
-- 服务进程重启后，内存中的任务状态会丢失。
-- 建议后端在拿到下载流后自行保存文件并维护业务侧文件路径/URL 映射。
+- 任务状态保存在内存中，服务重启后旧 task_id 会失效。
+- 输出目录默认在 LODGE_api/task_runs/{task_id}/。
+- 查询接口返回 progress 字段，可直接驱动前端进度条。
