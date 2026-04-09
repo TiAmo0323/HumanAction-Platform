@@ -1,124 +1,166 @@
 # InterGen Async API
 
-This folder hosts a web-oriented InterGen API that follows the async task style used by LODGE API.
+This folder provides an async HTTP API for text-to-motion generation and optional translation.
 
-本目录提供面向 Web 的 InterGen API，接口风格与 LODGE API 的异步任务模式保持一致。
+## 1. Endpoint List
 
-## Endpoints
+- GET /health
+- POST /translate
+- POST /v1/intergen/tasks/generate
+- GET /v1/intergen/tasks/{task_id}
+- GET /v1/intergen/tasks/{task_id}/download
 
-- `GET /health`
-- `POST /translate`
-- `POST /v1/intergen/tasks/generate`
-- `GET /v1/intergen/tasks/{task_id}`
-- `GET /v1/intergen/tasks/{task_id}/download`
+Task status values:
 
-## 接口说明（中文）
+- queued
+- running
+- succeeded
+- failed
 
-- `GET /health`
-  - 用途：健康检查。
-  - 返回：`{"status": "ok"}`。
-- `POST /translate`
-  - 用途：调用千问翻译接口。
-  - 请求体：`text`（必填）、`target_lang`（可选，默认 `English`）。
-- `POST /v1/intergen/tasks/generate`
-  - 用途：提交 InterGen 动作生成任务（异步）。
-  - 返回：任务信息（`task_id`、`status`、`message`、`stderr_tail` 等）。
-  - 说明：默认优先走 SMPL/SMPLX 渲染；若渲染失败会自动回退为火柴人视频，任务状态仍为 `succeeded`，并在 `message` 中给出中文提示。
-- `GET /v1/intergen/tasks/{task_id}`
-  - 用途：查询任务状态。
-  - 状态：`queued` / `running` / `succeeded` / `failed`。
-- `GET /v1/intergen/tasks/{task_id}/download`
-  - 用途：任务成功后下载生成的 mp4 文件。
+## 2. Run
 
-## Run
+Option A (recommended in this project):
 
-1. Activate the InterGen Python environment.
-2. From `InterGen_master` root, run:
+    start_intergen_api.bat
 
-```bash
-python InterGen_api/intergen_async_api.py
-```
+Option B (direct):
 
-Default port: `8001`.
+    python intergen_async_api.py
 
-## 启动方式（中文）
+Default port is 8001.
 
-1. 激活 InterGen 对应的 Python 环境（建议与模型推理环境一致）。
-2. 在 `InterGen_master` 根目录执行：
+## 3. Runtime Environment
 
-```bash
-python InterGen_api/intergen_async_api.py
-```
+The bat script sets these common variables:
 
-默认端口：`8001`。
+- INTERGEN_SOURCE_ROOT
+- INTERGEN_CONFIG_DIR
+- INTERGEN_HUMAN_MODELS_ROOT
+- INTERGEN_RENDER_MODE
+- INTERGEN_RENDER_BACKEND
+- INTERGEN_RENDER_PROFILE
+- INTERGEN_FPS
+- INTERGEN_MAX_RENDER_FRAMES
+- INTERGEN_BODY_MODEL
+- INTERGEN_ALIGN_WITH_STICKMAN_AXES
+- INTERGEN_FORCE_STICKMAN_AXES
 
-## Request Example
+If model/config paths are separated from this API wrapper, set INTERGEN_SOURCE_ROOT and INTERGEN_CONFIG_DIR explicitly.
 
-```json
-{
-  "text": "Two people meet, shake hands, and walk together."
-}
-```
+## 4. Core API Usage
 
-## 中文调用示例
+### 4.1 Create generation task
 
-### 1. 提交生成任务
+POST /v1/intergen/tasks/generate
 
-```json
-{
-  "text": "两个人相遇，握手后并排向前行走。"
-}
-```
+JSON body example:
 
-生成任务成功创建后的典型返回（`POST /v1/intergen/tasks/generate`）：
+    {
+      "text": "Two people meet, shake hands, and walk together."
+    }
 
-```json
-{
-  "task_id": "f8f65cbf-7d1b-4bbd-b2f5-589f09b8e5f7",
-  "status": "queued",
-  "created_at": "2026-03-27T12:00:00Z",
-  "updated_at": "2026-03-27T12:00:00Z",
-  "message": "Task queued",
-  "output_mp4_path": null,
-  "stderr_tail": ""
-}
-```
+Typical response:
 
-查询任务结果时（`GET /v1/intergen/tasks/{task_id}`）可能出现两种典型 `message`：
+    {
+      "task_id": "f8f65cbf-7d1b-4bbd-b2f5-589f09b8e5f7",
+      "status": "queued",
+      "created_at": "2026-03-27T12:00:00Z",
+      "updated_at": "2026-03-27T12:00:00Z",
+      "message": "Task queued",
+      "output_mp4_path": null,
+      "stderr_tail": ""
+    }
 
-- 正常 SMPL/SMPLX 渲染完成：`Task completed`
-- 渲染失败并自动回退火柴人：`模型生成失败，回退至火柴人模型，请重新生成视频`
+### 4.2 Query task
 
-若发生回退，`stderr_tail` 会包含回退前渲染异常的摘要，便于排查。
+GET /v1/intergen/tasks/{task_id}
 
-### 2. 翻译请求
+Current task model does not include a numeric progress field.
 
-```json
-{
-  "text": "两个人面对面打招呼，然后一起向左移动。",
-  "target_lang": "English"
-}
-```
+### 4.3 Download result
 
-## Notes
+GET /v1/intergen/tasks/{task_id}/download
 
-- Model weights/config are loaded at startup.
-- Rendering defaults use environment variables from existing InterGen runtime conventions.
-- Task outputs are stored under `InterGen_api/task_runs/<task_id>/output/`.
-- Translation endpoint uses Qwen MT via Dashscope-compatible OpenAI API.
-- Required env for translation: `DASHSCOPE_API_KEY`.
-- Optional env for translation: `DASHSCOPE_BASE_URL` (default: `https://dashscope.aliyuncs.com/compatible-mode/v1`).
-- Motion rendering mode is controlled by `INTERGEN_RENDER_MODE` (default `smpl`).
-- If `INTERGEN_RENDER_MODE` is not `smpl`, API generates skeleton video directly.
+Returns video/mp4 when task is succeeded.
 
-## 备注（中文）
+### 4.4 Translate text
 
-- 服务启动时会自动加载模型配置与权重。
-- 渲染参数默认沿用现有 InterGen 环境变量约定。
-- 任务产物默认保存在 `InterGen_api/task_runs/<task_id>/output/`。
-- 动作生成默认使用 `INTERGEN_RENDER_MODE=smpl`（即优先 SMPL/SMPLX 渲染）。
-- 当 `INTERGEN_RENDER_MODE` 不是 `smpl` 时，会直接输出火柴人视频。
-- 当 `INTERGEN_RENDER_MODE=smpl` 且渲染失败时，会自动回退到火柴人视频。
-- 翻译接口通过 Dashscope 兼容 OpenAI 的方式调用千问模型。
-- 翻译接口必需环境变量：`DASHSCOPE_API_KEY`。
-- 翻译接口可选环境变量：`DASHSCOPE_BASE_URL`（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）。
+POST /translate
+
+JSON body:
+
+    {
+      "text": "两个人面对面打招呼，然后一起向左移动。",
+      "target_lang": "English"
+    }
+
+Translation env requirements:
+
+- required: DASHSCOPE_API_KEY
+- optional: DASHSCOPE_BASE_URL (default https://dashscope.aliyuncs.com/compatible-mode/v1)
+
+## 5. Render Behavior Notes
+
+- Default mode prioritizes SMPL/SMPLX rendering.
+- If SMPL rendering fails and strict mode is not enabled, API falls back to skeleton rendering.
+- In fallback case, task can still be succeeded, and message may indicate fallback.
+
+Typical messages:
+
+- Task completed
+- 模型生成失败，回退至火柴人模型，请重新生成视频
+
+Outputs are stored under InterGen_api/task_runs/{task_id}/output/.
+
+## 6. Quick Curl Examples
+
+Create task:
+
+    curl -X POST "http://127.0.0.1:8001/v1/intergen/tasks/generate" -H "Content-Type: application/json" -d "{\"text\":\"两个人相遇，握手后并排向前行走。\"}"
+
+Query task:
+
+    curl "http://127.0.0.1:8001/v1/intergen/tasks/<task_id>"
+
+Download task result:
+
+    curl -L -o result.mp4 "http://127.0.0.1:8001/v1/intergen/tasks/<task_id>/download"
+
+---
+
+## 中文说明
+
+本目录提供 InterGen 的异步任务 API，供前端/后端通过 HTTP 调用文本生成人体动作视频。
+
+### 1. 启动方式
+
+推荐直接运行：
+
+    start_intergen_api.bat
+
+或手动运行：
+
+    python intergen_async_api.py
+
+默认端口 8001。
+
+### 2. 接口列表
+
+- GET /health
+- POST /translate
+- POST /v1/intergen/tasks/generate
+- GET /v1/intergen/tasks/{task_id}
+- GET /v1/intergen/tasks/{task_id}/download
+
+### 3. 任务流
+
+1. 提交生成任务，拿到 task_id。
+2. 轮询查询任务状态。
+3. 成功后下载 mp4。
+
+### 4. 重要说明
+
+- 当前任务响应没有 progress 字段。
+- 输出目录默认在 InterGen_api/task_runs/{task_id}/output/。
+- 若 SMPL 渲染失败，可能自动回退为火柴人渲染并返回成功状态，同时 message 给出提示。
+
