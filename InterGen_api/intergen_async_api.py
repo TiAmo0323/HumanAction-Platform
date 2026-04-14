@@ -1,5 +1,6 @@
 import os
 import sys
+import socket
 import threading
 import traceback
 import uuid
@@ -9,7 +10,10 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import copy
-import lightning as L
+try:
+    import lightning as L
+except Exception:
+    import pytorch_lightning as L
 import numpy as np
 import scipy.ndimage as filters
 import torch
@@ -46,8 +50,11 @@ def _looks_like_intergen_root(path: Path) -> bool:
 def _detect_source_root() -> str:
     candidates = [
         PROJECT_ROOT,
+        PROJECT_ROOT.parent / "InterGen" / "InterGen_master",
+        PROJECT_ROOT / "InterGen" / "InterGen_master",
         Path(os.getenv("INTERGEN_SOURCE_ROOT_DEFAULT", "")).expanduser() if os.getenv("INTERGEN_SOURCE_ROOT_DEFAULT") else None,
         Path("D:/InterGen/InterGen_master"),
+        Path("D:/HumanAction_Platform/InterGen/InterGen_master"),
         Path("D:/InterGen"),
     ]
     for c in candidates:
@@ -432,6 +439,38 @@ def _resolve_human_models_root() -> str:
     return get_human_models_root(str(PROJECT_ROOT))
 
 
+def _resolve_checkpoint_path(raw_checkpoint: str) -> Path:
+    raw = (raw_checkpoint or "").strip()
+    if not raw:
+        raise FileNotFoundError("Empty checkpoint path")
+
+    p = Path(raw).expanduser()
+    candidates = []
+
+    if p.is_absolute():
+        candidates.append(p.resolve())
+    else:
+        candidates.append((MODEL_SOURCE_ROOT / p).resolve())
+        candidates.append((PROJECT_ROOT / p).resolve())
+
+    # Portable fallbacks for common InterGen workspace layouts.
+    candidates.extend([
+        (MODEL_SOURCE_ROOT.parent / "checkpoints" / "intergen.ckpt").resolve(),
+        (PROJECT_ROOT.parent / "InterGen" / "checkpoints" / "intergen.ckpt").resolve(),
+    ])
+
+    seen = set()
+    for c in candidates:
+        key = str(c).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if c.exists():
+            return c
+
+    return candidates[0]
+
+
 class InterGenService:
     def __init__(self):
         self._model = None
@@ -470,9 +509,7 @@ class InterGenService:
 
         model = _build_model(model_cfg)
         if model_cfg.CHECKPOINT:
-            ckpt_path = Path(model_cfg.CHECKPOINT).expanduser()
-            if not ckpt_path.is_absolute():
-                ckpt_path = MODEL_SOURCE_ROOT / ckpt_path
+            ckpt_path = _resolve_checkpoint_path(str(model_cfg.CHECKPOINT))
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
             ckpt = torch.load(str(ckpt_path), map_location="cpu")
@@ -647,4 +684,16 @@ def download_task_result(task_id: str) -> FileResponse:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    host = os.getenv("INTERGEN_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    port = int(os.getenv("INTERGEN_PORT", "8001"))
+
+    # Fail fast on port conflicts before model startup work.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError:
+        raise SystemExit(f"Port {port} is already in use. Set INTERGEN_PORT to another value and retry.")
+    finally:
+        probe.close()
+
+    uvicorn.run(app, host=host, port=port)

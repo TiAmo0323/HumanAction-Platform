@@ -2,14 +2,26 @@
 setlocal
 
 REM Configure external InterGen source/config paths for this API wrapper.
-set "INTERGEN_SOURCE_ROOT=D:\InterGen\InterGen_master"
-set "INTERGEN_CONFIG_DIR=D:\InterGen\InterGen_master\configs"
-set "INTERGEN_HUMAN_MODELS_ROOT=D:\InterGen\InterGen_master\human_models"
+set "SCRIPT_DIR=%~dp0"
+set "PROJECT_ROOT=%SCRIPT_DIR%.."
+for %%I in ("%PROJECT_ROOT%") do set "PROJECT_ROOT=%%~fI"
+
+set "INTERGEN_SOURCE_ROOT=%PROJECT_ROOT%\..\InterGen\InterGen_master"
+if not exist "%INTERGEN_SOURCE_ROOT%\configs\model.yaml" (
+	set "INTERGEN_SOURCE_ROOT=%PROJECT_ROOT%\InterGen\InterGen_master"
+)
+if not exist "%INTERGEN_SOURCE_ROOT%\configs\model.yaml" (
+	set "INTERGEN_SOURCE_ROOT=%PROJECT_ROOT%"
+)
+
+set "INTERGEN_CONFIG_DIR=%INTERGEN_SOURCE_ROOT%\configs"
+set "INTERGEN_HUMAN_MODELS_ROOT=%INTERGEN_SOURCE_ROOT%\human_models"
 
 REM Keep imports deterministic: prioritize original InterGen source tree.
 set "PYTHONPATH=%INTERGEN_SOURCE_ROOT%;%PYTHONPATH%"
 
 REM Align runtime defaults with api_1_1-style quality profile.
+if "%INTERGEN_PORT%"=="" set "INTERGEN_PORT=8001"
 set "INTERGEN_RENDER_MODE=smpl"
 set "INTERGEN_RENDER_BACKEND=fast"
 set "INTERGEN_RENDER_PROFILE=quality"
@@ -22,6 +34,11 @@ set "INTERGEN_FORCE_STICKMAN_AXES=1"
 REM Optional runtime tuning.
 REM set "INTERGEN_DEVICE=cuda:0"
 
+set "INTERGEN_PYTHON=D:\Anaconda\envs\intergen_01\python.exe"
+if not exist "%INTERGEN_PYTHON%" (
+	set "INTERGEN_PYTHON=python"
+)
+
 echo INTERGEN_SOURCE_ROOT=%INTERGEN_SOURCE_ROOT%
 echo INTERGEN_CONFIG_DIR=%INTERGEN_CONFIG_DIR%
 echo INTERGEN_HUMAN_MODELS_ROOT=%INTERGEN_HUMAN_MODELS_ROOT%
@@ -33,8 +50,10 @@ echo INTERGEN_MAX_RENDER_FRAMES=%INTERGEN_MAX_RENDER_FRAMES%
 echo INTERGEN_BODY_MODEL=%INTERGEN_BODY_MODEL%
 echo INTERGEN_ALIGN_WITH_STICKMAN_AXES=%INTERGEN_ALIGN_WITH_STICKMAN_AXES%
 echo INTERGEN_FORCE_STICKMAN_AXES=%INTERGEN_FORCE_STICKMAN_AXES%
+echo INTERGEN_PORT=%INTERGEN_PORT%
+echo INTERGEN_PYTHON=%INTERGEN_PYTHON%
 echo.
 
-python "%~dp0intergen_async_api.py"
+"%INTERGEN_PYTHON%" "%~dp0intergen_async_api.py"
 
 endlocal
