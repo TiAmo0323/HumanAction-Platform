@@ -191,6 +191,7 @@ import axios from 'axios'
 
 const intergenApiBase = (import.meta.env.VITE_INTERGEN_API_BASE || 'http://127.0.0.1:8001').replace(/\/$/, '')
 const lodgeApiBase = (import.meta.env.VITE_LODGE_API_BASE || 'http://127.0.0.1:8002').replace(/\/$/, '')
+const lodgeRoot = (import.meta.env.VITE_LODGE_ROOT || 'D:/HumanAction_Platform/LODGE-main').trim()
 const lodgePythonExecutable = (import.meta.env.VITE_LODGE_PYTHON_EXECUTABLE || '').trim()
 
 const prompt = ref('')
@@ -303,8 +304,14 @@ const sendMessage = async () => {
       const fileObj = selectedMusicFileObj.value
       const ext = (fileObj.name.split('.').pop() || '').toLowerCase()
       const musicId = fileObj.name.split('.').slice(0, -1).join('.') || fileObj.name
+      if (!lodgeRoot) {
+        window.alert('未配置 LODGE 根目录，请在前端环境变量中设置 VITE_LODGE_ROOT。')
+        isGenerating.value = false
+        generationProgress.value = 0
+        return
+      }
       const formData = new FormData()
-      formData.append('lodge_root', 'D:/LODGE-main')
+      formData.append('lodge_root', lodgeRoot)
       formData.append('song_id', musicId)
       formData.append('mode', 'smplx')
       formData.append('device', '0')
