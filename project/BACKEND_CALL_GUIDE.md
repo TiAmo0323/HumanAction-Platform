@@ -85,7 +85,7 @@
 - 音频文件（`mp3/mp4/wav`）：
   - `POST /v1/lodge/tasks/infer-from-audio-upload`
   - 表单字段：
-    - `lodge_root`（固定传 `D:/LODGE-main`）
+    - `lodge_root`（前端读取 `VITE_LODGE_ROOT`，默认 `D:/HumanAction_Platform/LODGE-main`）
     - `song_id`（文件名去后缀）
     - `audio_file`（上传文件）
     - `python_executable`（可选，来自 `VITE_LODGE_PYTHON_EXECUTABLE`）
@@ -165,7 +165,7 @@ curl "http://127.0.0.1:8001/v1/intergen/tasks/<task_id>"
 
 ```bash
 curl -X POST "http://127.0.0.1:8002/v1/lodge/tasks/infer-from-audio-upload" \
-  -F "lodge_root=D:/LODGE-main" \
+  -F "lodge_root=D:/HumanAction_Platform/LODGE-main" \
   -F "song_id=demo001" \
   -F "mode=smplx" \
   -F "device=0" \
@@ -177,7 +177,7 @@ curl -X POST "http://127.0.0.1:8002/v1/lodge/tasks/infer-from-audio-upload" \
 
 ```bash
 curl -X POST "http://127.0.0.1:8002/v1/lodge/tasks/infer-from-feature-npy-upload" \
-  -F "lodge_root=D:/LODGE-main" \
+  -F "lodge_root=D:/HumanAction_Platform/LODGE-main" \
   -F "song_id=demo002" \
   -F "mode=smplx" \
   -F "device=0" \
