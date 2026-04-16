@@ -4,6 +4,8 @@ import socket
 import threading
 import traceback
 import uuid
+import re
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +119,9 @@ except Exception:
 
 class GenerateMotionRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text prompt for two-person motion generation")
+    num_samples: int = Field(default=5, ge=1, le=8, description="Number of candidates to sample before selecting best")
+    motion_frames: Optional[int] = Field(default=None, ge=60, le=240, description="Optional motion length in frames")
+    cfg_weight: Optional[float] = Field(default=None, ge=1.0, le=9.0, description="Optional classifier-free guidance weight")
 
 
 class TranslateRequest(BaseModel):
@@ -130,6 +135,8 @@ class TaskInfo(BaseModel):
     created_at: str
     updated_at: str
     message: str = ""
+    progress: int = 0
+    final_prompt: str = ""
     output_mp4_path: Optional[str] = None
     stderr_tail: str = ""
 
@@ -159,15 +166,58 @@ class LitGenModel(L.LightningModule):
             mp_joint.append(joint)
         plot_3d_motion(result_path, paramUtil.t2m_kinematic_chain, mp_joint, title=caption, fps=30)
 
-    def generate_one_sample(self, prompt: str, output_path: str) -> Dict[str, str]:
+    def _resolve_window_size(self, prompt: str, motion_frames: Optional[int]) -> int:
+        if motion_frames is not None:
+            return _clamp_int(motion_frames, 60, 240)
+
+        default_frames = _clamp_int(int(os.getenv("INTERGEN_MOTION_FRAMES", "168")), 60, 240)
+        prompt_l = prompt.lower()
+        if any(k in prompt_l for k in ["punch", "kick", "slap", "hit", "high five", "handshake"]):
+            return min(default_frames, 132)
+        if any(k in prompt_l for k in ["fencing", "fencer", "foil", "sabre", "sword", "duel"]):
+            return min(default_frames, 144)
+        if any(k in prompt_l for k in ["dance", "dancing", "waltz", "tango"]):
+            return max(default_frames, 180)
+        return default_frames
+
+    def _resolve_request_cfg_weight(self, prompt: str, cfg_weight: Optional[float]) -> float:
+        if cfg_weight is not None:
+            return _clamp_float(cfg_weight, 1.0, 9.0)
+
+        base = _clamp_float(float(os.getenv("INTERGEN_DEFAULT_REQUEST_CFG_WEIGHT", "5.0")), 1.0, 9.0)
+        prompt_l = prompt.lower()
+        if any(k in prompt_l for k in ["fencing", "fencer", "foil", "sabre", "sword", "duel"]):
+            # Slightly lower CFG helps avoid frozen poses for highly dynamic duels.
+            return min(base, 4.2)
+        if any(k in prompt_l for k in ["fight", "boxing", "box", "punch", "kick"]):
+            return min(base, 4.6)
+        return base
+
+    def generate_one_sample(
+        self,
+        prompt: str,
+        output_path: str,
+        motion_frames: Optional[int] = None,
+        cfg_weight: Optional[float] = None,
+    ) -> Dict[str, str]:
         self.model.eval()
         run_device = self._runtime_device()
         batch = OrderedDict({})
         batch["motion_lens"] = torch.zeros(1, 1, device=run_device).long()
         batch["prompt"] = prompt
 
-        window_size = 210
+        window_size = self._resolve_window_size(prompt, motion_frames)
+        request_cfg_weight = self._resolve_request_cfg_weight(prompt, cfg_weight)
+
+        old_cfg_weight = None
+        if hasattr(self.model, "decoder") and hasattr(self.model.decoder, "cfg_weight"):
+            old_cfg_weight = float(self.model.decoder.cfg_weight)
+            self.model.decoder.cfg_weight = request_cfg_weight
+
         motion_output = self.generate_loop(batch, window_size)
+
+        if old_cfg_weight is not None:
+            self.model.decoder.cfg_weight = old_cfg_weight
 
         render_mode = os.getenv("INTERGEN_RENDER_MODE", "smpl").strip().lower()
         body_model_type = os.getenv("INTERGEN_BODY_MODEL", "smplx").strip().lower()
@@ -222,6 +272,7 @@ class LitGenModel(L.LightningModule):
         print(f"[Render] body_model={body_model_type}")
         print(f"[Render] profile={profile_name}")
         print(f"[Render] device={run_device}")
+        print(f"[Render] request_cfg_weight={request_cfg_weight:.2f}")
         print(
             "[Render] effective "
             f"fps={fps}, dur_target={target_duration_sec:.2f}, dur_min={min_duration_sec:.2f}, "
@@ -426,6 +477,16 @@ def _tail_text(text: str, max_chars: int = 6000) -> str:
     return text[-max_chars:]
 
 
+def _pick_best_candidate(candidates: list) -> dict:
+    # Priority: prefer non-fallback SMPL result; tie-break by larger mp4 size.
+    def _rank(item: dict):
+        fallback_used = 1 if str(item.get("fallback_used", "0")) == "1" else 0
+        file_size = int(item.get("file_size", 0) or 0)
+        return (fallback_used, -file_size)
+
+    return sorted(candidates, key=_rank)[0]
+
+
 def _resolve_human_models_root() -> str:
     # Priority: explicit env > model source root > API project root.
     env_root = os.getenv("INTERGEN_HUMAN_MODELS_ROOT", "").strip()
@@ -487,7 +548,7 @@ class InterGenService:
         print(f"  render_mode(default): {os.getenv('INTERGEN_RENDER_MODE', 'smpl')}")
         print("Code source resolution:")
         print(f"  INTERGEN_SOURCE_ROOT: {INTERGEN_SOURCE_ROOT or '(auto-not-found)'}")
-        print(f"  CONFIGS_ROOT: {config_dir if 'config_dir' in locals() else '(unresolved)'}")
+        print(f"  CONFIGS_ROOT: {CONFIGS_ROOT}")
         print(f"  human_mesh_renderer_fast: {Path(_human_mesh_renderer_fast.__file__).resolve()}")
         print(f"  human_mesh_renderer: {Path(_human_mesh_renderer.__file__).resolve()}")
         print(f"  human_model_paths: {Path(_human_model_paths.__file__).resolve()}")
@@ -507,9 +568,38 @@ class InterGenService:
         model_cfg = get_config(str(model_yaml))
         infer_cfg = get_config(str(infer_yaml))
 
+        # yacs CfgNode loaded by get_config is frozen (immutable) by default.
+        # Temporarily defrost to apply startup-locked inference overrides.
+        model_cfg.defrost()
+
+        # Lock startup inference config so same service name always uses the same core inference knobs.
+        fixed_checkpoint_env = os.getenv("INTERGEN_FIXED_CHECKPOINT", "").strip()
+        if fixed_checkpoint_env:
+            ckpt_path = Path(fixed_checkpoint_env).expanduser().resolve()
+            if not ckpt_path.exists():
+                raise FileNotFoundError(f"INTERGEN_FIXED_CHECKPOINT not found: {ckpt_path}")
+            checkpoint_source = "INTERGEN_FIXED_CHECKPOINT"
+        else:
+            ckpt_path = _resolve_checkpoint_path(str(model_cfg.CHECKPOINT))
+            checkpoint_source = "model.yaml/CHECKPOINT(auto-resolved)"
+
+        fixed_cfg_weight_raw = os.getenv("INTERGEN_FIXED_CFG_WEIGHT", "5.0").strip()
+        fixed_strategy = os.getenv("INTERGEN_FIXED_SAMPLING_STRATEGY", "ddim50").strip() or "ddim50"
+        cfg_weight = _clamp_float(float(fixed_cfg_weight_raw), 1.0, 9.0)
+
+        model_cfg.CFG_WEIGHT = cfg_weight
+        model_cfg.STRATEGY = fixed_strategy
+        model_cfg.CHECKPOINT = str(ckpt_path)
+        model_cfg.freeze()
+
+        print("[Infer] Locked startup config:")
+        print(f"  checkpoint_source: {checkpoint_source}")
+        print(f"  checkpoint_path: {ckpt_path}")
+        print(f"  cfg_weight: {model_cfg.CFG_WEIGHT}")
+        print(f"  sampling_strategy: {model_cfg.STRATEGY}")
+
         model = _build_model(model_cfg)
         if model_cfg.CHECKPOINT:
-            ckpt_path = _resolve_checkpoint_path(str(model_cfg.CHECKPOINT))
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
             ckpt = torch.load(str(ckpt_path), map_location="cpu")
@@ -524,14 +614,61 @@ class InterGenService:
         self._model = LitGenModel(model, infer_cfg).to(device)
         print(f"[Device] preferred={preferred_device}, selected={device}")
 
-    def generate(self, prompt: str, output_path: Path):
+    def generate(
+        self,
+        prompt: str,
+        output_path: Path,
+        num_samples: int = 5,
+        motion_frames: Optional[int] = None,
+        cfg_weight: Optional[float] = None,
+    ):
         if self._model is None:
             raise RuntimeError("Model not loaded")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with self._infer_lock:
             with torch.no_grad():
-                return self._model.generate_one_sample(prompt, str(output_path))
+                sample_count = _clamp_int(num_samples, 1, 8)
+                candidate_dir = output_path.parent / "candidates"
+                candidate_dir.mkdir(parents=True, exist_ok=True)
+
+                candidates = []
+                for i in range(sample_count):
+                    candidate_path = candidate_dir / f"{output_path.stem}_sample{i+1}.mp4"
+                    result = self._model.generate_one_sample(
+                        prompt,
+                        str(candidate_path),
+                        motion_frames=motion_frames,
+                        cfg_weight=cfg_weight,
+                    )
+                    if not candidate_path.exists():
+                        raise FileNotFoundError(f"Expected sample output not found: {candidate_path}")
+                    candidates.append(
+                        {
+                            "path": candidate_path,
+                            "file_size": candidate_path.stat().st_size,
+                            **(result or {}),
+                        }
+                    )
+
+                best = _pick_best_candidate(candidates)
+                best_path = Path(best["path"])
+                shutil.copy2(str(best_path), str(output_path))
+
+                keep_all = os.getenv("INTERGEN_KEEP_ALL_SAMPLES", "0").strip() == "1"
+                if not keep_all:
+                    for item in candidates:
+                        p = Path(item["path"])
+                        if p != best_path and p.exists():
+                            p.unlink()
+
+                best_idx = candidates.index(best) + 1
+                summary_message = f"Best-of-{sample_count} selected sample #{best_idx}."
+                merged = dict(best)
+                merged["selected_sample"] = str(best_idx)
+                merged["num_samples"] = str(sample_count)
+                merged["message"] = f"{best.get('message', 'Task completed')} {summary_message}".strip()
+                return merged
 
 
 app = FastAPI(title="InterGen Async API", version="1.0.0")
@@ -563,14 +700,111 @@ def _update_task(task_id: str, **kwargs) -> None:
         _tasks[task_id] = TaskInfo(**data)
 
 
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    cleaned = (text or "").strip().replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"^(translation|translated|english)\s*[:：-]\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" \t\"'“”‘’")
+
+
+def _optimize_prompt_for_intergen(text: str) -> str:
+    prompt = _sanitize_prompt_text(text)
+    if not prompt:
+        return "Two people are interacting physically."
+
+    if _contains_cjk(prompt):
+        # Translation failed or returned mixed-language text.
+        return "Two people are dancing together."
+
+    prompt_l = prompt.lower()
+
+    if any(k in prompt_l for k in ["dance", "dancing", "waltz", "tango"]):
+        return "Two people are dancing together face to face with synchronized body movements."
+    if any(k in prompt_l for k in ["fencing", "fencer", "foil", "sabre", "sword", "duel"]):
+        return "Two fencers are rapidly lunging, parrying, and stepping in an intense duel."
+    if any(k in prompt_l for k in ["hug", "embrace"]):
+        return "Two people are hugging each other while standing face to face."
+    if any(k in prompt_l for k in ["fight", "boxing", "box", "punch", "kick"]):
+        return "Two people are fighting with coordinated punches and defensive movements."
+    if any(k in prompt_l for k in ["handshake", "shake hands"]):
+        return "Two people are shaking hands while standing face to face."
+
+    if not re.search(r"\b(two|2)\b", prompt_l):
+        prompt = f"Two people are {prompt.rstrip('.')}"
+
+    words = prompt.split()
+    if len(words) > 24:
+        prompt = " ".join(words[:24])
+    if not prompt.endswith("."):
+        prompt += "."
+    return prompt
+
+
+def _translate_if_needed(text: str) -> str:
+    """
+    If the text contains Chinese characters, attempt to translate to English using DashScope.
+    If DashScope is not configured or errors occur, returns the original text to let the model try.
+    """
+    if not _contains_cjk(text):
+        return _sanitize_prompt_text(text)
+
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        print("[Translate] Dashscope API Key missing, skipping translation.")
+        return text
+
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        completion = client.chat.completions.create(
+            model="qwen-mt-flash",
+            messages=[{"role": "user", "content": text}],
+            extra_body={
+                "translation_options": {
+                    "source_lang": "auto",
+                    "target_lang": "English",
+                }
+            },
+        )
+        translated = completion.choices[0].message.content
+        if translated:
+            translated = _sanitize_prompt_text(translated)
+            print(f"[Translate] {text} -> {translated}")
+            return translated
+    except Exception as e:
+        print(f"[Translate] Error during translation: {e}")
+    return _sanitize_prompt_text(text)
+
+
+def _prepare_prompt_for_model(text: str) -> str:
+    translated = _translate_if_needed(text)
+    optimized = _optimize_prompt_for_intergen(translated)
+    print(f"[Prompt] model_input={optimized}")
+    return optimized
+
+
 def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
     try:
-        _update_task(task_id, status="running", message="Task is running")
+        _update_task(task_id, status="running", message="Translating prompt...", progress=10)
+        final_prompt = _prepare_prompt_for_model(req.text)
+        
+        _update_task(task_id, status="running", message="Generating motion...", progress=30)
 
         task_root = DEFAULT_TASK_ROOT / task_id
         output_path = task_root / "output" / f"{task_id}.mp4"
 
-        render_result = service.generate(req.text, output_path)
+        render_result = service.generate(
+            final_prompt,
+            output_path,
+            num_samples=req.num_samples,
+            motion_frames=req.motion_frames,
+            cfg_weight=req.cfg_weight,
+        )
 
         if not output_path.exists():
             raise FileNotFoundError(f"Expected output not found: {output_path}")
@@ -583,6 +817,8 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             task_id,
             status="succeeded",
             message=task_message,
+            progress=100,
+            final_prompt=final_prompt,
             output_mp4_path=str(output_path.resolve()),
             stderr_tail=stderr_tail,
         )
@@ -591,6 +827,7 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             task_id,
             status="failed",
             message=str(exc),
+            progress=100,
             stderr_tail=_tail_text(traceback.format_exc()),
         )
 
