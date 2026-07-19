@@ -31,6 +31,8 @@ Default port in current code is 8002.
 - POST /v1/lodge/tasks/infer-from-feature-npy-upload
 - GET /v1/lodge/tasks/{task_id}
 - GET /v1/lodge/tasks/{task_id}/download
+- GET /v1/lodge/tasks/{task_id}/download-bvh
+- GET /v1/lodge/tasks/{task_id}/download-retarget
 - POST /v1/lodge/tasks/{task_id}/open-output-folder
 - POST /v1/lodge/tasks/{task_id}/open-output-player
 
@@ -109,10 +111,19 @@ Query task:
     GET /v1/lodge/tasks/{task_id}
 
 Task response includes progress (0-100), message, output_mp4_path, stdout_tail, stderr_tail.
+It also includes output_npy_path, output_bvh_path, output_retarget_mp4_path, retarget_status, and retarget_message.
 
 Download result mp4:
 
     GET /v1/lodge/tasks/{task_id}/download
+
+Download exported BVH:
+
+    GET /v1/lodge/tasks/{task_id}/download-bvh
+
+Download retargeted character mp4 when retarget_status=succeeded:
+
+    GET /v1/lodge/tasks/{task_id}/download-retarget
 
 Supports:
 
@@ -132,6 +143,14 @@ These endpoints open the output folder or mp4 using the backend host OS.
 ## 7. Notes
 
 - The API wraps existing infer_lodge.py and render.py behavior.
+- Every rendered motion npy is now exported to a same-name BVH in the task input directory.
+- Optional Blender/Rokoko retargeting can be enabled per request with retarget_enabled=true or globally with LODGE_RETARGET_ENABLED=1.
+- Retargeting environment variables:
+  - LODGE_BLENDER_EXE: Blender executable path.
+  - LODGE_TARGET_FBX: target character FBX path. Defaults to D:/HumanAction_Platform/X Bot.fbx when present.
+  - LODGE_RETARGET_MAPPING: Rokoko mapping JSON path. Defaults to momask-main/assets/mapping.json.
+  - LODGE_RETARGET_SCRIPT: Blender Python script path. Defaults to LODGE_api/blender_rokoko_retarget.py.
+  - LODGE_RETARGET_STRICT: set 1 to fail the whole task when retargeting fails.
 - Task state is kept in memory and will be lost after API restart.
 - Outputs are stored under LODGE_api/task_runs/{task_id}/.
 

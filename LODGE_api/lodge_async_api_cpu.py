@@ -4,7 +4,6 @@ import sys
 import threading
 import uuid
 import os
-import json
 import numpy as np
 import uvicorn
 from concurrent.futures import ThreadPoolExecutor
@@ -20,23 +19,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 APP_ROOT = Path(__file__).resolve().parent
-PLATFORM_ROOT = APP_ROOT.parent.parent
 DEFAULT_TASK_ROOT = APP_ROOT / "task_runs"
 DEFAULT_TASK_ROOT.mkdir(parents=True, exist_ok=True)
 SUBPROCESS_ENCODING = os.getenv("LODGE_SUBPROCESS_ENCODING", "utf-8")
 SUBPROCESS_ERRORS = os.getenv("LODGE_SUBPROCESS_ERRORS", "replace")
 
-
-def _default_target_fbx() -> str:
-    return str((PLATFORM_ROOT / "X Bot.fbx").resolve())
-
-
-def _default_mapping_file() -> str:
-    return str((PLATFORM_ROOT / "momask-main" / "assets" / "mapping.json").resolve())
-
-
-def _default_retarget_script() -> str:
-    return str((APP_ROOT / "blender_rokoko_retarget.py").resolve())
+CPU_INFER_SCRIPT = os.getenv("LODGE_CPU_INFER_SCRIPT", "infer_lodge_cpu.py").strip() or "infer_lodge_cpu.py"
+CPU_RENDER_SCRIPT = os.getenv("LODGE_CPU_RENDER_SCRIPT", "render_cpu.py").strip() or "render_cpu.py"
 
 
 class RenderSongRequest(BaseModel):
@@ -45,14 +34,8 @@ class RenderSongRequest(BaseModel):
     song_id: str = Field(..., description="Song id like 132")
     python_executable: Optional[str] = Field(default=sys.executable, description="Python executable in lodge conda env")
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
-    device: str = Field(default="0", description="GPU device id string")
+    device: str = Field(default="cpu", description="CPU mode placeholder, ignored in CPU API")
     fps: int = Field(default=30, ge=1, le=120)
-    retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
-    target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
-    mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
-    blender_executable: Optional[str] = Field(default=None, description="Blender executable path")
-    retarget_script: Optional[str] = Field(default=None, description="Blender Python retarget script path")
-    retarget_strict: bool = Field(default=False, description="Fail the task if retargeting fails")
 
 
 class InferAndRenderRequest(BaseModel):
@@ -68,14 +51,8 @@ class InferAndRenderRequest(BaseModel):
         description="Optional explicit sample dir. If omitted, API auto-detects latest samples_dod_* dir",
     )
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
-    device: str = Field(default="0", description="GPU device id string")
+    device: str = Field(default="cpu", description="CPU mode placeholder, ignored in CPU API")
     fps: int = Field(default=30, ge=1, le=120)
-    retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
-    target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
-    mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
-    blender_executable: Optional[str] = Field(default=None, description="Blender executable path")
-    retarget_script: Optional[str] = Field(default=None, description="Blender Python retarget script path")
-    retarget_strict: bool = Field(default=False, description="Fail the task if retargeting fails")
 
 
 class InferFromAudioRequest(BaseModel):
@@ -88,14 +65,8 @@ class InferFromAudioRequest(BaseModel):
         description="Extra args passed to infer_lodge.py, e.g. ['--soft', '1.0']",
     )
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
-    device: str = Field(default="0", description="GPU device id string")
+    device: str = Field(default="cpu", description="CPU mode placeholder, ignored in CPU API")
     fps: int = Field(default=30, ge=1, le=120)
-    retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
-    target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
-    mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
-    blender_executable: Optional[str] = Field(default=None, description="Blender executable path")
-    retarget_script: Optional[str] = Field(default=None, description="Blender Python retarget script path")
-    retarget_strict: bool = Field(default=False, description="Fail the task if retargeting fails")
 
 
 class InferFromFeatureNpyRequest(BaseModel):
@@ -108,14 +79,8 @@ class InferFromFeatureNpyRequest(BaseModel):
         description="Extra args passed to infer_lodge.py, e.g. ['--soft', '1.0']",
     )
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
-    device: str = Field(default="0", description="GPU device id string")
+    device: str = Field(default="cpu", description="CPU mode placeholder, ignored in CPU API")
     fps: int = Field(default=30, ge=1, le=120)
-    retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
-    target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
-    mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
-    blender_executable: Optional[str] = Field(default=None, description="Blender executable path")
-    retarget_script: Optional[str] = Field(default=None, description="Blender Python retarget script path")
-    retarget_strict: bool = Field(default=False, description="Fail the task if retargeting fails")
 
 
 class TaskInfo(BaseModel):
@@ -126,16 +91,11 @@ class TaskInfo(BaseModel):
     updated_at: str
     message: str = ""
     output_mp4_path: Optional[str] = None
-    output_npy_path: Optional[str] = None
-    output_bvh_path: Optional[str] = None
-    output_retarget_mp4_path: Optional[str] = None
-    retarget_status: str = ""
-    retarget_message: str = ""
     stdout_tail: str = ""
     stderr_tail: str = ""
 
 
-app = FastAPI(title="LODGE Async API", version="1.0.0")
+app = FastAPI(title="LODGE Async API (CPU)", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -251,6 +211,7 @@ def _run_command_with_heartbeat(
 ) -> subprocess.CompletedProcess:
     _update_task(task_id, message=running_message, progress=progress)
     env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "-1"
     if env_overrides:
         env.update({k: str(v) for k, v in env_overrides.items()})
 
@@ -286,6 +247,8 @@ def _run_command_with_heartbeat(
 
 
 def _run_command_inherit_cwd(command: List[str], cwd: Path) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "-1"
     return subprocess.run(
         command,
         cwd=str(cwd),
@@ -294,6 +257,7 @@ def _run_command_inherit_cwd(command: List[str], cwd: Path) -> subprocess.Comple
         encoding=SUBPROCESS_ENCODING,
         errors=SUBPROCESS_ERRORS,
         check=False,
+        env=env,
     )
 
 
@@ -316,163 +280,6 @@ def _cap_motion_frames_inplace(npy_path: Path, max_frames: int) -> Optional[str]
 
     np.save(str(npy_path), data[:max_frames])
     return f"Frame count clipped from {frame_count} to {max_frames}"
-
-
-def _retarget_options_from_req(req) -> Dict[str, object]:
-    return {
-        "enabled": bool(getattr(req, "retarget_enabled", False)),
-        "target_fbx": getattr(req, "target_fbx", None),
-        "mapping_file": getattr(req, "mapping_file", None),
-        "blender_executable": getattr(req, "blender_executable", None),
-        "retarget_script": getattr(req, "retarget_script", None),
-        "strict": bool(getattr(req, "retarget_strict", False)),
-    }
-
-
-def _export_bvh_for_npy(
-    task_id: str,
-    lodge_root: Path,
-    target_npy: Path,
-    python_exe: str,
-    fps: int,
-) -> Path:
-    target_bvh = target_npy.with_suffix(".bvh")
-    command = [
-        python_exe,
-        "lodge2bvh.py",
-        "--input",
-        str(target_npy),
-        "--output",
-        str(target_bvh),
-        "--fps",
-        str(fps),
-    ]
-    _update_task(task_id, progress=76, message="Exporting BVH from generated npy")
-    proc = _run_command(command, lodge_root)
-    if proc.returncode != 0 or not target_bvh.exists():
-        raise RuntimeError(f"BVH export failed: {proc.stderr or proc.stdout}")
-    _update_task(task_id, output_bvh_path=str(target_bvh.resolve()))
-    return target_bvh
-
-
-def _resolve_retarget_path(raw_value: Optional[str], env_name: str, default_value: str) -> Optional[Path]:
-    raw = (raw_value or os.getenv(env_name, "") or default_value).strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser().resolve()
-
-
-def _run_retarget_if_requested(
-    task_id: str,
-    task_root: Path,
-    source_npy: Path,
-    source_bvh: Path,
-    song_id: str,
-    fps: int,
-    retarget_options: Optional[Dict[str, object]],
-) -> None:
-    options = retarget_options or {}
-    enabled = bool(options.get("enabled")) or _env_flag("LODGE_RETARGET_ENABLED", False)
-    if not enabled:
-        _update_task(task_id, retarget_status="skipped", retarget_message="Retarget disabled")
-        return
-
-    strict = bool(options.get("strict")) or _env_flag("LODGE_RETARGET_STRICT", False)
-    retarget_dir = task_root / "retarget"
-    retarget_dir.mkdir(parents=True, exist_ok=True)
-
-    blender_exe = _resolve_retarget_path(
-        options.get("blender_executable") if isinstance(options.get("blender_executable"), str) else None,
-        "LODGE_BLENDER_EXE",
-        "",
-    )
-    retarget_script = _resolve_retarget_path(
-        options.get("retarget_script") if isinstance(options.get("retarget_script"), str) else None,
-        "LODGE_RETARGET_SCRIPT",
-        _default_retarget_script(),
-    )
-    target_fbx = _resolve_retarget_path(
-        options.get("target_fbx") if isinstance(options.get("target_fbx"), str) else None,
-        "LODGE_TARGET_FBX",
-        _default_target_fbx(),
-    )
-    mapping_file = _resolve_retarget_path(
-        options.get("mapping_file") if isinstance(options.get("mapping_file"), str) else None,
-        "LODGE_RETARGET_MAPPING",
-        _default_mapping_file(),
-    )
-
-    output_mp4 = retarget_dir / f"{song_id}_retarget.mp4"
-    report_path = retarget_dir / "rokoko_retarget_report.json"
-    manifest_path = retarget_dir / "retarget_manifest.json"
-
-    manifest = {
-        "task_id": task_id,
-        "engine": "blender-rokoko",
-        "source_npy": str(source_npy.resolve()),
-        "source_bvh": str(source_bvh.resolve()),
-        "source_bvh_files": [str(source_bvh.resolve())],
-        "target_fbx": str(target_fbx),
-        "mapping_file": str(mapping_file),
-        "output_mp4": str(output_mp4.resolve()),
-        "report_path": str(report_path.resolve()),
-        "debug_blend": str((retarget_dir / "retarget_debug.blend").resolve()),
-        "fps": fps,
-        "max_render_frames": _env_int("LODGE_RETARGET_MAX_RENDER_FRAMES", 120),
-        "render_size": os.getenv("LODGE_RETARGET_RENDER_SIZE", "1080x1080"),
-        "camera_distance_scale": float(os.getenv("LODGE_RETARGET_CAMERA_DISTANCE_SCALE", "1.15")),
-        "created_at": _utc_now(),
-    }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    required_paths = [blender_exe, retarget_script, target_fbx, mapping_file, source_bvh]
-    missing = [str(path) if path is not None else "(empty)" for path in required_paths if path is None or not path.exists()]
-    if missing:
-        message = "Retarget skipped, missing required path(s): " + "; ".join(missing)
-        _update_task(task_id, retarget_status="skipped", retarget_message=message)
-        if strict:
-            raise FileNotFoundError(message)
-        return
-
-    command = [
-        str(blender_exe),
-        "--background",
-        "--python",
-        str(retarget_script),
-        "--",
-        "--manifest",
-        str(manifest_path),
-    ]
-    _update_task(task_id, progress=78, message="Running Blender/Rokoko retarget", retarget_status="running")
-    timeout_sec = _env_int("LODGE_RETARGET_TIMEOUT_SEC", 3600)
-    proc = _run_command_with_heartbeat(
-        command=command,
-        cwd=retarget_dir,
-        task_id=task_id,
-        running_message="Running Blender/Rokoko retarget",
-        progress=78,
-        timeout_sec=timeout_sec,
-        heartbeat_sec=10,
-    )
-    if proc.returncode == 0 and output_mp4.exists():
-        _update_task(
-            task_id,
-            output_retarget_mp4_path=str(output_mp4.resolve()),
-            retarget_status="succeeded",
-            retarget_message="Rokoko retarget completed",
-        )
-        return
-
-    message = _last_nonempty_line(proc.stderr) or _last_nonempty_line(proc.stdout) or "Blender/Rokoko retarget failed"
-    _update_task(
-        task_id,
-        retarget_status="failed",
-        retarget_message=message,
-        stderr_tail=_tail_text(proc.stderr or ""),
-        stdout_tail=_tail_text(proc.stdout or ""),
-    )
-    if strict:
-        raise RuntimeError(message)
 
 
 def _build_render_attempts(mode: str, fps: int) -> List[Tuple[str, int]]:
@@ -506,13 +313,13 @@ def _render_with_retry(
     for idx, (attempt_mode, attempt_fps) in enumerate(attempts, start=1):
         render_command = [
             python_exe,
-            "render.py",
+            CPU_RENDER_SCRIPT,
             "--modir",
             str(input_dir),
             "--mode",
             attempt_mode,
             "--device",
-            device,
+            "cpu",
             "--fps",
             str(attempt_fps),
         ]
@@ -636,17 +443,7 @@ def _extract_music_feature_npy(lodge_root: Path, python_exe: str, wav_path: Path
     return _run_command_inherit_cwd([python_exe, "-c", code], lodge_root)
 
 
-def _render_from_sample_dir(
-    task_id: str,
-    lodge_root: Path,
-    sample_dir: Path,
-    song_id: str,
-    python_exe: str,
-    mode: str,
-    device: str,
-    fps: int,
-    retarget_options: Optional[Dict[str, object]] = None,
-) -> None:
+def _render_from_sample_dir(task_id: str, lodge_root: Path, sample_dir: Path, song_id: str, python_exe: str, mode: str, device: str, fps: int) -> None:
     source_npy = sample_dir / "concat" / "npy" / f"{song_id}.npy"
     if not source_npy.exists():
         raise FileNotFoundError(f"Source npy not found: {source_npy}")
@@ -656,28 +453,9 @@ def _render_from_sample_dir(
     input_dir.mkdir(parents=True, exist_ok=True)
     target_npy = input_dir / f"{song_id}.npy"
     shutil.copy2(source_npy, target_npy)
-    _update_task(task_id, output_npy_path=str(target_npy.resolve()))
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
-
-    target_bvh = _export_bvh_for_npy(
-        task_id=task_id,
-        lodge_root=lodge_root,
-        target_npy=target_npy,
-        python_exe=python_exe,
-        fps=fps,
-    )
-    task_root = DEFAULT_TASK_ROOT / task_id
-    _run_retarget_if_requested(
-        task_id=task_id,
-        task_root=task_root,
-        source_npy=target_npy,
-        source_bvh=target_bvh,
-        song_id=song_id,
-        fps=fps,
-        retarget_options=retarget_options,
-    )
 
     _render_with_retry(
         task_id=task_id,
@@ -691,17 +469,7 @@ def _render_from_sample_dir(
     )
 
 
-def _render_from_npy_file(
-    task_id: str,
-    lodge_root: Path,
-    source_npy: Path,
-    song_id: str,
-    python_exe: str,
-    mode: str,
-    device: str,
-    fps: int,
-    retarget_options: Optional[Dict[str, object]] = None,
-) -> None:
+def _render_from_npy_file(task_id: str, lodge_root: Path, source_npy: Path, song_id: str, python_exe: str, mode: str, device: str, fps: int) -> None:
     if not source_npy.exists():
         raise FileNotFoundError(f"Source npy not found: {source_npy}")
 
@@ -710,28 +478,9 @@ def _render_from_npy_file(
     input_dir.mkdir(parents=True, exist_ok=True)
     target_npy = input_dir / f"{song_id}.npy"
     shutil.copy2(source_npy, target_npy)
-    _update_task(task_id, output_npy_path=str(target_npy.resolve()))
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
-
-    target_bvh = _export_bvh_for_npy(
-        task_id=task_id,
-        lodge_root=lodge_root,
-        target_npy=target_npy,
-        python_exe=python_exe,
-        fps=fps,
-    )
-    task_root = DEFAULT_TASK_ROOT / task_id
-    _run_retarget_if_requested(
-        task_id=task_id,
-        task_root=task_root,
-        source_npy=target_npy,
-        source_bvh=target_bvh,
-        song_id=song_id,
-        fps=fps,
-        retarget_options=retarget_options,
-    )
 
     _render_with_retry(
         task_id=task_id,
@@ -766,7 +515,6 @@ def _run_render_task(task_id: str, req: RenderSongRequest) -> None:
             mode=req.mode,
             device=req.device,
             fps=req.fps,
-            retarget_options=_retarget_options_from_req(req),
         )
 
     except Exception as exc:
@@ -782,12 +530,12 @@ def _run_infer_and_render_task(task_id: str, req: InferAndRenderRequest) -> None
             raise FileNotFoundError(f"lodge_root not found: {lodge_root}")
 
         infer_timeout_sec = int(os.getenv("LODGE_INFER_TIMEOUT_SEC", "3600"))
-        infer_command = [req.python_executable or sys.executable, "infer_lodge.py"] + req.infer_args
+        infer_command = [req.python_executable or sys.executable, CPU_INFER_SCRIPT] + req.infer_args
         infer_proc = _run_command_with_heartbeat(
             command=infer_command,
             cwd=lodge_root,
             task_id=task_id,
-            running_message="Running infer_lodge.py",
+            running_message=f"Running {CPU_INFER_SCRIPT}",
             progress=45,
             timeout_sec=infer_timeout_sec,
             env_overrides={"LODGE_SONG_IDS": req.song_id},
@@ -797,7 +545,7 @@ def _run_infer_and_render_task(task_id: str, req: InferAndRenderRequest) -> None
 
         if infer_proc.returncode != 0:
             reason = _last_nonempty_line(infer_stderr) or _last_nonempty_line(infer_stdout)
-            msg = f"infer_lodge.py failed with return code {infer_proc.returncode}"
+            msg = f"{CPU_INFER_SCRIPT} failed with return code {infer_proc.returncode}"
             if reason:
                 msg = f"{msg}: {reason}"
             _update_task(
@@ -821,7 +569,6 @@ def _run_infer_and_render_task(task_id: str, req: InferAndRenderRequest) -> None
             mode=req.mode,
             device=req.device,
             fps=req.fps,
-            retarget_options=_retarget_options_from_req(req),
         )
 
     except Exception as exc:
@@ -864,15 +611,15 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
             )
             return
 
-        _update_task(task_id, progress=45, message="Running infer_lodge.py")
+        _update_task(task_id, progress=45, message=f"Running {CPU_INFER_SCRIPT}")
         start_ts = datetime.utcnow().timestamp()
         infer_timeout_sec = int(os.getenv("LODGE_INFER_TIMEOUT_SEC", "3600"))
-        infer_command = [req.python_executable or sys.executable, "infer_lodge.py"] + req.infer_args
+        infer_command = [req.python_executable or sys.executable, CPU_INFER_SCRIPT] + req.infer_args
         infer_proc = _run_command_with_heartbeat(
             command=infer_command,
             cwd=lodge_root,
             task_id=task_id,
-            running_message="Running infer_lodge.py",
+            running_message=f"Running {CPU_INFER_SCRIPT}",
             progress=45,
             timeout_sec=infer_timeout_sec,
             env_overrides={
@@ -886,7 +633,7 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
 
         if infer_proc.returncode != 0:
             reason = _last_nonempty_line(infer_stderr) or _last_nonempty_line(infer_stdout)
-            msg = f"infer_lodge.py failed with return code {infer_proc.returncode}"
+            msg = f"{CPU_INFER_SCRIPT} failed with return code {infer_proc.returncode}"
             if reason:
                 msg = f"{msg}: {reason}"
             _update_task(
@@ -909,7 +656,6 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
             mode=req.mode,
             device=req.device,
             fps=req.fps,
-            retarget_options=_retarget_options_from_req(req),
         )
 
     except Exception as exc:
@@ -933,15 +679,15 @@ def _run_infer_from_feature_npy_task(task_id: str, req: InferFromFeatureNpyReque
         out_npy = music_npy_dir / f"{song_id}.npy"
         shutil.copy2(feature_npy_path, out_npy)
 
-        _update_task(task_id, progress=45, message="Running infer_lodge.py")
+        _update_task(task_id, progress=45, message=f"Running {CPU_INFER_SCRIPT}")
         start_ts = datetime.utcnow().timestamp()
         infer_timeout_sec = int(os.getenv("LODGE_INFER_TIMEOUT_SEC", "3600"))
-        infer_command = [req.python_executable or sys.executable, "infer_lodge.py"] + req.infer_args
+        infer_command = [req.python_executable or sys.executable, CPU_INFER_SCRIPT] + req.infer_args
         infer_proc = _run_command_with_heartbeat(
             command=infer_command,
             cwd=lodge_root,
             task_id=task_id,
-            running_message="Running infer_lodge.py",
+            running_message=f"Running {CPU_INFER_SCRIPT}",
             progress=45,
             timeout_sec=infer_timeout_sec,
             env_overrides={
@@ -955,7 +701,7 @@ def _run_infer_from_feature_npy_task(task_id: str, req: InferFromFeatureNpyReque
 
         if infer_proc.returncode != 0:
             reason = _last_nonempty_line(infer_stderr) or _last_nonempty_line(infer_stdout)
-            msg = f"infer_lodge.py failed with return code {infer_proc.returncode}"
+            msg = f"{CPU_INFER_SCRIPT} failed with return code {infer_proc.returncode}"
             if reason:
                 msg = f"{msg}: {reason}"
             _update_task(
@@ -978,7 +724,6 @@ def _run_infer_from_feature_npy_task(task_id: str, req: InferFromFeatureNpyReque
             mode=req.mode,
             device=req.device,
             fps=req.fps,
-            retarget_options=_retarget_options_from_req(req),
         )
 
     except Exception as exc:
@@ -994,7 +739,6 @@ def _run_render_from_uploaded_npy_task(
     mode: str,
     device: str,
     fps: int,
-    retarget_options: Optional[Dict[str, object]] = None,
 ) -> None:
     try:
         _update_task(task_id, status="running", progress=20, message="Rendering uploaded npy")
@@ -1015,7 +759,6 @@ def _run_render_from_uploaded_npy_task(
             mode=mode,
             device=device,
             fps=fps,
-            retarget_options=retarget_options,
         )
     except Exception as exc:
         _update_task(task_id, status="failed", message=str(exc))
@@ -1090,15 +833,9 @@ async def create_infer_from_audio_upload_task(
     audio_file: UploadFile = File(...),
     python_executable: Optional[str] = Form(default=None),
     mode: str = Form(default="smplx"),
-    device: str = Form(default="0"),
+    device: str = Form(default="cpu"),
     fps: int = Form(default=30),
     infer_args: str = Form(default=""),
-    retarget_enabled: bool = Form(default=False),
-    target_fbx: Optional[str] = Form(default=None),
-    mapping_file: Optional[str] = Form(default=None),
-    blender_executable: Optional[str] = Form(default=None),
-    retarget_script: Optional[str] = Form(default=None),
-    retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
     task_id = str(uuid.uuid4())
     now = _utc_now()
@@ -1131,12 +868,6 @@ async def create_infer_from_audio_upload_task(
         mode=mode,
         device=device,
         fps=fps,
-        retarget_enabled=retarget_enabled,
-        target_fbx=target_fbx,
-        mapping_file=mapping_file,
-        blender_executable=blender_executable,
-        retarget_script=retarget_script,
-        retarget_strict=retarget_strict,
     )
 
     executor.submit(_run_infer_from_audio_task, task_id, req)
@@ -1150,14 +881,8 @@ async def create_render_from_npy_upload_task(
     npy_file: UploadFile = File(...),
     python_executable: Optional[str] = Form(default=None),
     mode: str = Form(default="smplx"),
-    device: str = Form(default="0"),
+    device: str = Form(default="cpu"),
     fps: int = Form(default=30),
-    retarget_enabled: bool = Form(default=False),
-    target_fbx: Optional[str] = Form(default=None),
-    mapping_file: Optional[str] = Form(default=None),
-    blender_executable: Optional[str] = Form(default=None),
-    retarget_script: Optional[str] = Form(default=None),
-    retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
     task_id = str(uuid.uuid4())
     now = _utc_now()
@@ -1188,14 +913,6 @@ async def create_render_from_npy_upload_task(
         mode,
         device,
         fps,
-        {
-            "enabled": retarget_enabled,
-            "target_fbx": target_fbx,
-            "mapping_file": mapping_file,
-            "blender_executable": blender_executable,
-            "retarget_script": retarget_script,
-            "strict": retarget_strict,
-        },
     )
     return task
 
@@ -1207,15 +924,9 @@ async def create_infer_from_feature_npy_upload_task(
     npy_file: UploadFile = File(...),
     python_executable: Optional[str] = Form(default=None),
     mode: str = Form(default="smplx"),
-    device: str = Form(default="0"),
+    device: str = Form(default="cpu"),
     fps: int = Form(default=30),
     infer_args: str = Form(default=""),
-    retarget_enabled: bool = Form(default=False),
-    target_fbx: Optional[str] = Form(default=None),
-    mapping_file: Optional[str] = Form(default=None),
-    blender_executable: Optional[str] = Form(default=None),
-    retarget_script: Optional[str] = Form(default=None),
-    retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
     task_id = str(uuid.uuid4())
     now = _utc_now()
@@ -1246,12 +957,6 @@ async def create_infer_from_feature_npy_upload_task(
         mode=mode,
         device=device,
         fps=fps,
-        retarget_enabled=retarget_enabled,
-        target_fbx=target_fbx,
-        mapping_file=mapping_file,
-        blender_executable=blender_executable,
-        retarget_script=retarget_script,
-        retarget_strict=retarget_strict,
     )
 
     executor.submit(_run_infer_from_feature_npy_task, task_id, req)
@@ -1402,40 +1107,6 @@ def download_task_result(task_id: str, request: Request, as_attachment: bool = F
             "Accept-Ranges": "bytes",
         },
     )
-
-
-@app.get("/v1/lodge/tasks/{task_id}/download-bvh")
-def download_task_bvh(task_id: str) -> FileResponse:
-    with _task_lock:
-        task = _tasks.get(task_id)
-
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.output_bvh_path:
-        raise HTTPException(status_code=409, detail="BVH not exported")
-
-    bvh_path = Path(task.output_bvh_path)
-    if not bvh_path.exists():
-        raise HTTPException(status_code=410, detail="BVH file no longer exists")
-
-    return FileResponse(path=str(bvh_path), media_type="application/octet-stream", filename=bvh_path.name)
-
-
-@app.get("/v1/lodge/tasks/{task_id}/download-retarget")
-def download_task_retarget_result(task_id: str) -> FileResponse:
-    with _task_lock:
-        task = _tasks.get(task_id)
-
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.retarget_status != "succeeded" or not task.output_retarget_mp4_path:
-        raise HTTPException(status_code=409, detail="Retarget result not completed")
-
-    mp4_path = Path(task.output_retarget_mp4_path)
-    if not mp4_path.exists():
-        raise HTTPException(status_code=410, detail="Retarget output file no longer exists")
-
-    return FileResponse(path=str(mp4_path), media_type="video/mp4", filename=mp4_path.name)
 
 if __name__ == "__main__":
     access_log_enabled = os.getenv("LODGE_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}

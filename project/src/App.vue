@@ -9,7 +9,6 @@
           <div class="logo-orb"></div>
           <div>
             <h1>Nova Chat</h1>
-            <p>Built with Vue 3</p>
           </div>
         </div>
 
@@ -189,10 +188,19 @@
 import { computed, nextTick, ref } from 'vue'
 import axios from 'axios'
 
-const intergenApiBase = (import.meta.env.VITE_INTERGEN_API_BASE || 'http://127.0.0.1:8001').replace(/\/$/, '')
-const lodgeApiBase = (import.meta.env.VITE_LODGE_API_BASE || 'http://127.0.0.1:8002').replace(/\/$/, '')
+const runtimeHost = (import.meta.env.VITE_API_HOST || (typeof window !== 'undefined' ? window.location.hostname : '47.116.49.93') || '47.116.49.93').trim()
+const runtimeProtocol = (import.meta.env.VITE_API_PROTOCOL || (typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http') || 'http').trim().toLowerCase()
+const apiProtocol = runtimeProtocol === 'https' ? 'https' : 'http'
+
+const intergenApiBase = (import.meta.env.VITE_INTERGEN_API_BASE || `${apiProtocol}://${runtimeHost}:8001`).replace(/\/$/, '')
+const lodgeApiBase = (import.meta.env.VITE_LODGE_API_BASE || `${apiProtocol}://${runtimeHost}:8002`).replace(/\/$/, '')
 const lodgeRoot = (import.meta.env.VITE_LODGE_ROOT || 'D:/HumanAction_Platform/LODGE-main').trim()
 const lodgePythonExecutable = (import.meta.env.VITE_LODGE_PYTHON_EXECUTABLE || '').trim()
+const lodgeRetargetEnabled = String(import.meta.env.VITE_LODGE_RETARGET_ENABLED || '').trim().toLowerCase() === 'true'
+const lodgeBlenderExecutable = (import.meta.env.VITE_LODGE_BLENDER_EXE || '').trim()
+const lodgeTargetFbx = (import.meta.env.VITE_LODGE_TARGET_FBX || '').trim()
+const lodgeRetargetMapping = (import.meta.env.VITE_LODGE_RETARGET_MAPPING || '').trim()
+const lodgeRetargetScript = (import.meta.env.VITE_LODGE_RETARGET_SCRIPT || '').trim()
 
 const prompt = ref('')
 const isGenerating = ref(false)
@@ -316,8 +324,21 @@ const sendMessage = async () => {
       formData.append('mode', 'smplx')
       formData.append('device', '0')
       formData.append('fps', '30')
+      formData.append('retarget_enabled', lodgeRetargetEnabled ? 'true' : 'false')
       if (lodgePythonExecutable) {
         formData.append('python_executable', lodgePythonExecutable)
+      }
+      if (lodgeBlenderExecutable) {
+        formData.append('blender_executable', lodgeBlenderExecutable)
+      }
+      if (lodgeTargetFbx) {
+        formData.append('target_fbx', lodgeTargetFbx)
+      }
+      if (lodgeRetargetMapping) {
+        formData.append('mapping_file', lodgeRetargetMapping)
+      }
+      if (lodgeRetargetScript) {
+        formData.append('retarget_script', lodgeRetargetScript)
       }
 
       if (ext === 'npy') {
@@ -389,9 +410,10 @@ const startPolling = (taskId, baseUrl) => {
         taskStatusText.value = '任务已完成，视频可播放或下载。'
 
         // 设置生成的视频地址 (供页面上的 <video> 标签使用)
-        generatedVideoUrl.value = `${baseUrl}/${taskId}/download`
-        generatedVideoDownloadUrl.value = `${baseUrl}/${taskId}/download?as_attachment=true`
-        generatedVideoFilePath.value = task.output_mp4_path || ''
+        const hasRetargetVideo = task.retarget_status === 'succeeded' && task.output_retarget_mp4_path
+        generatedVideoUrl.value = hasRetargetVideo ? `${baseUrl}/${taskId}/download-retarget` : `${baseUrl}/${taskId}/download`
+        generatedVideoDownloadUrl.value = hasRetargetVideo ? `${baseUrl}/${taskId}/download-retarget` : `${baseUrl}/${taskId}/download?as_attachment=true`
+        generatedVideoFilePath.value = hasRetargetVideo ? task.output_retarget_mp4_path : (task.output_mp4_path || '')
         generatedTaskId.value = taskId
         generatedTaskBaseUrl.value = baseUrl
 
