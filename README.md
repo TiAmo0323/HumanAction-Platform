@@ -104,7 +104,10 @@ HumanAction-Platform-main/
 ├─ config/
 │  └─ skin_catalog.json                 # InterGen/LODGE 统一蒙皮资源目录
 ├─ shared/
-│  └─ skin_catalog.py                   # 蒙皮校验与资源路径解析
+│  ├─ __init__.py                       # 将 shared 标记为可导入的 Python 包
+│  └─ skin_catalog.py                   # 蒙皮配置加载、校验与资源路径解析
+├─ tests/
+│  └─ test_skin_output_selection.py     # 单选/多选蒙皮的快速回归测试
 ├─ InterGen_api/
 │  ├─ intergen_async_api.py             # 文本生成异步 API
 │  ├─ intergen_async_api_cpu.py         # CPU 兼容 API
@@ -127,6 +130,71 @@ HumanAction-Platform-main/
    ├─ src/config/skinOptions.js
    ├─ BACKEND_CALL_GUIDE.md
    └─ package.json
+```
+
+## 蒙皮配置、共享解析与回归测试
+
+### `config/skin_catalog.json`
+
+该文件是 InterGen 和 LODGE 后端共用的蒙皮配置，也是服务端的蒙皮事实来源。当前配置包含：
+
+- `smpl`：`output_kind` 为 `smpl`，保留普通 SMPL/SMPL-X 预览视频。
+- `robot`：`output_kind` 为 `retarget`，调用 Blender/Rokoko 生成机器人重定向视频。
+
+顶层 `default_skin_id` 指定未传入任何蒙皮参数时的默认选项，当前为 `smpl`。每个 `skins` 条目可包含：
+
+| 字段 | 含义 |
+|---|---|
+| `id` | 前后端传递的唯一蒙皮标识，不能重复 |
+| `label` | 前端展示名称 |
+| `category` | 前端分组或资源分类 |
+| `description` | 蒙皮用途说明 |
+| `output_kind` | 输出链路；当前后端仅支持 `smpl` 和 `retarget` |
+| `backend_mode` | 后端模型/渲染模式标识，当前配置为 `smplx` |
+| `target_fbx` | 重定向目标角色 FBX；仅重定向蒙皮需要 |
+| `mapping_file` | Rokoko 骨骼映射文件；仅重定向蒙皮需要 |
+
+`target_fbx` 和 `mapping_file` 可以使用绝对路径，也可以使用相对于 `config/skin_catalog.json` 所在目录的路径。通过统一目录，前端、InterGen 和 LODGE 不再各自硬编码同一套蒙皮信息。
+
+注意：向 JSON 中增加配置只会让目录能够识别新蒙皮，不会自动实现新的输出链路。若新资源使用 `smpl`、`retarget` 之外的 `output_kind`，或需要在同一任务中同时重定向到多个不同 FBX，仍需扩展对应后端的生成与结果管理逻辑。
+
+### `shared/__init__.py` 与 `shared/skin_catalog.py`
+
+`shared/__init__.py` 将目录标记为共享 Python 包，供两个 API 导入统一逻辑。`shared/skin_catalog.py` 负责：
+
+- 读取 `config/skin_catalog.json`，也可通过 `HUMAN_ACTION_SKIN_CATALOG` 指向另一份目录文件。
+- 校验空目录、重复 `id`、非法 `output_kind` 和不存在的默认蒙皮。
+- 对 `skin_ids` 去空、去重并保持用户选择顺序。
+- 将相对的 FBX 和骨骼映射路径解析为绝对路径。
+- 为 `/skins` 接口生成不含本机资源路径的公开蒙皮信息。
+- 判断某个蒙皮是否需要执行 Blender/Rokoko 重定向。
+
+请求参数的解析优先级为：
+
+```text
+skin_ids
+  > 旧版单值 skin_id
+  > 旧版 retarget_enabled
+  > 默认 smpl
+```
+
+因此，显式传入 `skin_ids=["smpl"]` 时，即使旧参数 `retarget_enabled=true` 也只生成 SMPL；旧客户端只传 `retarget_enabled=true` 时则兼容为同时请求 `smpl` 和 `robot`。
+
+### `tests/test_skin_output_selection.py`
+
+这是蒙皮选择链路的快速回归测试。测试会导入真实的 InterGen/LODGE API 模块，但会模拟耗时的模型推理和重定向输出，因此不需要实际启动服务、加载模型或调用 Blender。当前覆盖：
+
+- 单选 `smpl`：只保留 SMPL 视频，不执行机器人重定向。
+- 单选 `robot`：只保留机器人视频，并清理临时 SMPL 及候选预览视频。
+- 同时选择 `smpl`、`robot`：生成并保留两类输出。
+- 显式 `skin_ids` 对旧版 `retarget_enabled` 的覆盖规则。
+- 旧版 `retarget_enabled=true` 向双选行为的兼容映射。
+- 任务返回的 `available_skin_ids` 与磁盘上实际保留的视频一致。
+
+在项目根目录运行：
+
+```bat
+D:\Anaconda\envs\intergen_01\python.exe tests\test_skin_output_selection.py
 ```
 
 ## 环境准备
