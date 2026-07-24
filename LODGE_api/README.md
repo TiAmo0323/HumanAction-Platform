@@ -10,19 +10,19 @@ Run in this folder:
 
 ## 2. Run
 
-Option A (direct):
+Canonical startup entry for the frontend-compatible API:
 
-    python lodge_async_api.py
+    start_lodge_api_retarget.bat
 
-Option B (uvicorn):
-
-    uvicorn lodge_async_api:app --host 0.0.0.0 --port 8002
+All future backend changes must remain reachable through this BAT. The script
+configures Blender/FBX/mapping resources; `skin_ids` decides which videos run.
 
 Default port in current code is 8002.
 
 ## 3. Endpoint List
 
 - GET /health
+- GET /v1/lodge/skins
 - POST /v1/lodge/tasks/render-song
 - POST /v1/lodge/tasks/infer-and-render
 - POST /v1/lodge/tasks/infer-from-audio
@@ -58,7 +58,8 @@ JSON body example:
       "python_executable": "D:/anaconda3/envs/lodge/python.exe",
       "mode": "smplx",
       "device": "0",
-      "fps": 30
+      "fps": 30,
+      "skin_ids": ["smpl"]
     }
 
 ### 4.2 Infer + render in one call
@@ -74,7 +75,8 @@ JSON body example:
       "infer_args": ["--soft", "1.0"],
       "mode": "smplx",
       "device": "0",
-      "fps": 30
+      "fps": 30,
+      "skin_ids": ["robot"]
     }
 
 Optional field:
@@ -94,6 +96,8 @@ multipart/form-data fields:
 - mode (optional, default smplx)
 - device (optional, default 0)
 - fps (optional, default 30)
+- skin_ids (optional repeated field, `smpl` and/or `robot`; default smpl)
+- skin_id (legacy single-value compatibility)
 - infer_args (optional, comma-separated string)
 
 Supported uploaded audio/video formats are converted internally to wav when needed.
@@ -110,8 +114,10 @@ Query task:
 
     GET /v1/lodge/tasks/{task_id}
 
-Task response includes progress (0-100), message, output_mp4_path, stdout_tail, stderr_tail.
-It also includes output_npy_path, output_bvh_path, output_retarget_mp4_path, retarget_status, and retarget_message.
+Task response includes progress (0-100), message, requested_skin_ids, available_skin_ids,
+output_mp4_path, stdout_tail, and stderr_tail. It also includes output_npy_path,
+output_bvh_path, output_retarget_mp4_path, output_retarget_path,
+retarget_status, and retarget_message.
 
 Download result mp4:
 
@@ -139,18 +145,32 @@ For local deployment on the same machine:
 - POST /v1/lodge/tasks/{task_id}/open-output-player
 
 These endpoints open the output folder or mp4 using the backend host OS.
+Both accept an optional `skin_id` query parameter and will locate the selected
+SMPL or retarget video instead of always opening the SMPL preview.
 
 ## 7. Notes
 
 - The API wraps existing infer_lodge.py and render.py behavior.
+- `skin_ids=["robot"]` enables only retarget output; `["smpl"]` enables only
+  SMPL output; selecting both generates both.
+- `GET /v1/lodge/skins` returns the public skin list used by the frontend.
+- The old `retarget_enabled=true` request remains supported for backward compatibility.
 - Every rendered motion npy is now exported to a same-name BVH in the task input directory.
-- Optional Blender/Rokoko retargeting can be enabled per request with retarget_enabled=true or globally with LODGE_RETARGET_ENABLED=1.
+- `retarget_enabled=true` remains a legacy compatibility input. Global
+  `LODGE_RETARGET_ENABLED` no longer overrides explicit task selection.
 - Retargeting environment variables:
   - LODGE_BLENDER_EXE: Blender executable path.
   - LODGE_TARGET_FBX: target character FBX path. Defaults to D:/HumanAction_Platform/X Bot.fbx when present.
   - LODGE_RETARGET_MAPPING: Rokoko mapping JSON path. Defaults to momask-main/assets/mapping.json.
   - LODGE_RETARGET_SCRIPT: Blender Python script path. Defaults to LODGE_api/blender_rokoko_retarget.py.
   - LODGE_RETARGET_STRICT: set 1 to fail the whole task when retargeting fails.
+  - LODGE_RETARGET_RENDER_ENGINE: Blender render engine. The canonical launcher fixes it to BLENDER_EEVEE_NEXT.
+  - LODGE_RETARGET_EEVEE_SAMPLES: Eevee render samples. The canonical launcher uses 32 for the current performance/quality test.
+  - LODGE_RETARGET_RESOLUTION_PERCENTAGE: output resolution scale. The canonical launcher fixes it to 100.
+  - LODGE_RETARGET_HAND_TORSO_COLLISION: enable target-space hand-to-torso collision avoidance. Defaults to 1.
+  - LODGE_RETARGET_HAND_TORSO_CLEARANCE: hand clearance outside the torso proxy in meters. Defaults to 0.025.
+  - LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION: maximum wrist correction per frame in meters. Defaults to 0.12.
+- Hand-to-torso collision avoidance builds an animated proxy from the target mesh and uses temporally smoothed two-bone arm IK. Metrics are written to `hand_torso_collision_avoidance` in `rokoko_retarget_report.json`.
 - Task state is kept in memory and will be lost after API restart.
 - Outputs are stored under LODGE_api/task_runs/{task_id}/.
 
@@ -168,13 +188,9 @@ These endpoints open the output folder or mp4 using the backend host OS.
 
 ### 2. 启动
 
-方式一：
+统一通过：
 
-    python lodge_async_api.py
-
-方式二：
-
-    uvicorn lodge_async_api:app --host 0.0.0.0 --port 8002
+    start_lodge_api_retarget.bat
 
 当前代码默认端口为 8002。
 
@@ -198,3 +214,7 @@ These endpoints open the output folder or mp4 using the backend host OS.
 - 任务状态保存在内存中，服务重启后旧 task_id 会失效。
 - 输出目录默认在 LODGE_api/task_runs/{task_id}/。
 - 查询接口返回 progress 字段，可直接驱动前端进度条。
+- 当前统一启动脚本将机器人渲染固定为 Eevee Next、32 samples、100% 分辨率；实际值会同时写入 retarget manifest 和 Blender 报告，便于进行画质和耗时对比。
+- 推荐启动脚本默认启用目标角色空间的手—躯干防穿模处理。它从 Hips/Spine 蒙皮顶点建立逐帧截面代理，并用带平滑权重的双骨手臂 IK 把穿入的手腕目标移到体表外。
+- 常用参数为 `LODGE_RETARGET_HAND_TORSO_CLEARANCE=0.025` 和 `LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION=0.12`；完整参数及前后指标会写入 `retarget_manifest.json` 和 `rokoko_retarget_report.json`。
+- 修改这些环境变量后必须重启 API；历史任务不会自动应用新配置。

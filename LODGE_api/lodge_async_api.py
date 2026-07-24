@@ -20,11 +20,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 APP_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_ROOT.parent
 PLATFORM_ROOT = APP_ROOT.parent.parent
 DEFAULT_TASK_ROOT = APP_ROOT / "task_runs"
 DEFAULT_TASK_ROOT.mkdir(parents=True, exist_ok=True)
 SUBPROCESS_ENCODING = os.getenv("LODGE_SUBPROCESS_ENCODING", "utf-8")
 SUBPROCESS_ERRORS = os.getenv("LODGE_SUBPROCESS_ERRORS", "replace")
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from shared.skin_catalog import (
+    SkinCatalogError,
+    public_skin_catalog,
+    resolve_skin_resource,
+    resolve_skins,
+    skin_requires_retarget,
+)
 
 
 def _default_target_fbx() -> str:
@@ -47,6 +59,14 @@ class RenderSongRequest(BaseModel):
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
     device: str = Field(default="0", description="GPU device id string")
     fps: int = Field(default=30, ge=1, le=120)
+    skin_ids: Optional[List[str]] = Field(
+        default=None,
+        description="One or more requested skin ids; takes precedence over legacy skin_id",
+    )
+    skin_id: Optional[str] = Field(
+        default=None,
+        description="Requested skin id from config/skin_catalog.json; defaults to smpl",
+    )
     retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
     mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
@@ -70,6 +90,14 @@ class InferAndRenderRequest(BaseModel):
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
     device: str = Field(default="0", description="GPU device id string")
     fps: int = Field(default=30, ge=1, le=120)
+    skin_ids: Optional[List[str]] = Field(
+        default=None,
+        description="One or more requested skin ids; takes precedence over legacy skin_id",
+    )
+    skin_id: Optional[str] = Field(
+        default=None,
+        description="Requested skin id from config/skin_catalog.json; defaults to smpl",
+    )
     retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
     mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
@@ -90,6 +118,14 @@ class InferFromAudioRequest(BaseModel):
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
     device: str = Field(default="0", description="GPU device id string")
     fps: int = Field(default=30, ge=1, le=120)
+    skin_ids: Optional[List[str]] = Field(
+        default=None,
+        description="One or more requested skin ids; takes precedence over legacy skin_id",
+    )
+    skin_id: Optional[str] = Field(
+        default=None,
+        description="Requested skin id from config/skin_catalog.json; defaults to smpl",
+    )
     retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
     mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
@@ -110,6 +146,14 @@ class InferFromFeatureNpyRequest(BaseModel):
     mode: str = Field(default="smplx", pattern="^(smpl|smplh|smplx)$")
     device: str = Field(default="0", description="GPU device id string")
     fps: int = Field(default=30, ge=1, le=120)
+    skin_ids: Optional[List[str]] = Field(
+        default=None,
+        description="One or more requested skin ids; takes precedence over legacy skin_id",
+    )
+    skin_id: Optional[str] = Field(
+        default=None,
+        description="Requested skin id from config/skin_catalog.json; defaults to smpl",
+    )
     retarget_enabled: bool = Field(default=False, description="Export BVH and optionally run Blender/Rokoko retarget")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
     mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
@@ -124,11 +168,15 @@ class TaskInfo(BaseModel):
     progress: int = Field(default=0, ge=0, le=100)
     created_at: str
     updated_at: str
+    skin_id: str = "smpl"
+    requested_skin_ids: List[str] = Field(default_factory=lambda: ["smpl"])
+    available_skin_ids: List[str] = Field(default_factory=list)
     message: str = ""
     output_mp4_path: Optional[str] = None
     output_npy_path: Optional[str] = None
     output_bvh_path: Optional[str] = None
     output_retarget_mp4_path: Optional[str] = None
+    output_retarget_path: Optional[str] = None
     retarget_status: str = ""
     retarget_message: str = ""
     stdout_tail: str = ""
@@ -154,6 +202,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
@@ -186,13 +244,72 @@ def _last_nonempty_line(text: str) -> str:
     return ""
 
 
+def _resolve_request_skins(req) -> List[Dict[str, object]]:
+    return resolve_skins(
+        PROJECT_ROOT,
+        getattr(req, "skin_ids", None),
+        skin_id=getattr(req, "skin_id", None),
+        legacy_retarget_enabled=bool(getattr(req, "retarget_enabled", False)),
+    )
+
+
+def _resolve_request_skin(req) -> Dict[str, object]:
+    return _resolve_request_skins(req)[0]
+
+
+def _validate_skin_selection(
+    skin_ids: Optional[List[str]],
+    skin_id: Optional[str] = None,
+    retarget_enabled: bool = False,
+) -> List[Dict[str, object]]:
+    try:
+        return resolve_skins(
+            PROJECT_ROOT,
+            skin_ids,
+            skin_id=skin_id,
+            legacy_retarget_enabled=retarget_enabled,
+        )
+    except SkinCatalogError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _validate_request_skins(req) -> List[Dict[str, object]]:
+    return _validate_skin_selection(
+        getattr(req, "skin_ids", None),
+        getattr(req, "skin_id", None),
+        bool(getattr(req, "retarget_enabled", False)),
+    )
+
+
+def _validate_request_skin(req) -> Dict[str, object]:
+    return _validate_request_skins(req)[0]
+
+
 def _update_task(task_id: str, **kwargs) -> None:
     with _task_lock:
         task = _tasks.get(task_id)
         if task is None:
             return
-        data = task.model_dump()
+        if hasattr(task, "model_dump"):
+            data = task.model_dump()
+        else:
+            data = task.dict()
         data.update(kwargs)
+        retarget_path = data.get("output_retarget_mp4_path") or data.get("output_retarget_path")
+        if retarget_path:
+            data["output_retarget_mp4_path"] = retarget_path
+            data["output_retarget_path"] = retarget_path
+        available_skin_ids = []
+        if data.get("output_mp4_path"):
+            available_skin_ids.append("smpl")
+        if data.get("retarget_status") == "succeeded" and retarget_path:
+            requested_skin_ids = list(data.get("requested_skin_ids") or [])
+            retarget_skin_id = next(
+                (skin_id for skin_id in requested_skin_ids if skin_id != "smpl"),
+                "robot",
+            )
+            available_skin_ids.append(retarget_skin_id)
+        data["available_skin_ids"] = available_skin_ids
         data["updated_at"] = _utc_now()
         _tasks[task_id] = TaskInfo(**data)
 
@@ -319,10 +436,35 @@ def _cap_motion_frames_inplace(npy_path: Path, max_frames: int) -> Optional[str]
 
 
 def _retarget_options_from_req(req) -> Dict[str, object]:
+    skin_profiles = _resolve_request_skins(req)
+    skin_profile = next(
+        (profile for profile in skin_profiles if skin_requires_retarget(profile)),
+        None,
+    )
+    render_smpl = any(
+        str(profile.get("output_kind") or "") == "smpl"
+        for profile in skin_profiles
+    )
     return {
-        "enabled": bool(getattr(req, "retarget_enabled", False)),
-        "target_fbx": getattr(req, "target_fbx", None),
-        "mapping_file": getattr(req, "mapping_file", None),
+        "enabled": skin_profile is not None,
+        "render_smpl": render_smpl,
+        "skin_id": str(skin_profile["id"]) if skin_profile else "",
+        "target_fbx": (
+            getattr(req, "target_fbx", None)
+            or (
+                resolve_skin_resource(PROJECT_ROOT, skin_profile, "target_fbx")
+                if skin_profile
+                else None
+            )
+        ),
+        "mapping_file": (
+            getattr(req, "mapping_file", None)
+            or (
+                resolve_skin_resource(PROJECT_ROOT, skin_profile, "mapping_file")
+                if skin_profile
+                else None
+            )
+        ),
         "blender_executable": getattr(req, "blender_executable", None),
         "retarget_script": getattr(req, "retarget_script", None),
         "strict": bool(getattr(req, "retarget_strict", False)),
@@ -372,7 +514,7 @@ def _run_retarget_if_requested(
     retarget_options: Optional[Dict[str, object]],
 ) -> None:
     options = retarget_options or {}
-    enabled = bool(options.get("enabled")) or _env_flag("LODGE_RETARGET_ENABLED", False)
+    enabled = bool(options.get("enabled"))
     if not enabled:
         _update_task(task_id, retarget_status="skipped", retarget_message="Retarget disabled")
         return
@@ -408,6 +550,7 @@ def _run_retarget_if_requested(
 
     manifest = {
         "task_id": task_id,
+        "skin_id": str(options.get("skin_id") or "robot"),
         "engine": "blender-rokoko",
         "source_npy": str(source_npy.resolve()),
         "source_bvh": str(source_bvh.resolve()),
@@ -420,7 +563,52 @@ def _run_retarget_if_requested(
         "fps": fps,
         "max_render_frames": _env_int("LODGE_RETARGET_MAX_RENDER_FRAMES", 120),
         "render_size": os.getenv("LODGE_RETARGET_RENDER_SIZE", "1080x1080"),
-        "camera_distance_scale": float(os.getenv("LODGE_RETARGET_CAMERA_DISTANCE_SCALE", "1.15")),
+        "render_engine": os.getenv(
+            "LODGE_RETARGET_RENDER_ENGINE",
+            "BLENDER_EEVEE_NEXT",
+        ),
+        "eevee_render_samples": _env_int("LODGE_RETARGET_EEVEE_SAMPLES", 32),
+        "resolution_percentage": _env_int(
+            "LODGE_RETARGET_RESOLUTION_PERCENTAGE",
+            100,
+        ),
+        "camera_distance_scale": _env_float("LODGE_RETARGET_CAMERA_DISTANCE_SCALE", 1.15),
+        "hand_torso_collision_enabled": _env_flag(
+            "LODGE_RETARGET_HAND_TORSO_COLLISION",
+            True,
+        ),
+        "hand_torso_collision_torso_minimum_weight": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_MINIMUM_WEIGHT",
+            0.5,
+        ),
+        "hand_torso_collision_slice_half_height": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_SLICE_HALF_HEIGHT",
+            0.05,
+        ),
+        "hand_torso_collision_proxy_scale": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_PROXY_SCALE",
+            0.95,
+        ),
+        "hand_torso_collision_clearance": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_CLEARANCE",
+            0.025,
+        ),
+        "hand_torso_collision_penetration_threshold": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_PENETRATION_THRESHOLD",
+            0.005,
+        ),
+        "hand_torso_collision_blend_frames": _env_int(
+            "LODGE_RETARGET_HAND_TORSO_BLEND_FRAMES",
+            4,
+        ),
+        "hand_torso_collision_smoothing_window": _env_int(
+            "LODGE_RETARGET_HAND_TORSO_SMOOTHING_WINDOW",
+            5,
+        ),
+        "hand_torso_collision_max_correction": _env_float(
+            "LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION",
+            0.12,
+        ),
         "created_at": _utc_now(),
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -636,6 +824,33 @@ def _extract_music_feature_npy(lodge_root: Path, python_exe: str, wav_path: Path
     return _run_command_inherit_cwd([python_exe, "-c", code], lodge_root)
 
 
+def _finalize_retarget_only_task(task_id: str) -> None:
+    with _task_lock:
+        current = _tasks.get(task_id)
+    retarget_succeeded = bool(
+        current
+        and current.retarget_status == "succeeded"
+        and (current.output_retarget_mp4_path or current.output_retarget_path)
+    )
+    if retarget_succeeded:
+        _update_task(
+            task_id,
+            status="succeeded",
+            progress=100,
+            message="Requested retarget skin completed",
+            output_mp4_path=None,
+        )
+        return
+    reason = current.retarget_message if current else "Retarget state unavailable"
+    _update_task(
+        task_id,
+        status="failed",
+        progress=100,
+        message=f"Requested retarget skin was not generated: {reason}",
+        output_mp4_path=None,
+    )
+
+
 def _render_from_sample_dir(
     task_id: str,
     lodge_root: Path,
@@ -679,16 +894,19 @@ def _render_from_sample_dir(
         retarget_options=retarget_options,
     )
 
-    _render_with_retry(
-        task_id=task_id,
-        lodge_root=lodge_root,
-        input_dir=input_dir,
-        song_id=song_id,
-        python_exe=python_exe,
-        mode=mode,
-        device=device,
-        fps=fps,
-    )
+    if bool((retarget_options or {}).get("render_smpl", True)):
+        _render_with_retry(
+            task_id=task_id,
+            lodge_root=lodge_root,
+            input_dir=input_dir,
+            song_id=song_id,
+            python_exe=python_exe,
+            mode=mode,
+            device=device,
+            fps=fps,
+        )
+    else:
+        _finalize_retarget_only_task(task_id)
 
 
 def _render_from_npy_file(
@@ -733,16 +951,19 @@ def _render_from_npy_file(
         retarget_options=retarget_options,
     )
 
-    _render_with_retry(
-        task_id=task_id,
-        lodge_root=lodge_root,
-        input_dir=input_dir,
-        song_id=song_id,
-        python_exe=python_exe,
-        mode=mode,
-        device=device,
-        fps=fps,
-    )
+    if bool((retarget_options or {}).get("render_smpl", True)):
+        _render_with_retry(
+            task_id=task_id,
+            lodge_root=lodge_root,
+            input_dir=input_dir,
+            song_id=song_id,
+            python_exe=python_exe,
+            mode=mode,
+            device=device,
+            fps=fps,
+        )
+    else:
+        _finalize_retarget_only_task(task_id)
 
 
 def _run_render_task(task_id: str, req: RenderSongRequest) -> None:
@@ -1026,8 +1247,18 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/v1/lodge/skins")
+def get_supported_skins() -> Dict[str, object]:
+    try:
+        return public_skin_catalog(PROJECT_ROOT)
+    except SkinCatalogError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/v1/lodge/tasks/render-song", response_model=TaskInfo)
 def create_render_song_task(req: RenderSongRequest) -> TaskInfo:
+    skin_profiles = _validate_request_skins(req)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1036,6 +1267,8 @@ def create_render_song_task(req: RenderSongRequest) -> TaskInfo:
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1047,6 +1280,8 @@ def create_render_song_task(req: RenderSongRequest) -> TaskInfo:
 
 @app.post("/v1/lodge/tasks/infer-and-render", response_model=TaskInfo)
 def create_infer_and_render_task(req: InferAndRenderRequest) -> TaskInfo:
+    skin_profiles = _validate_request_skins(req)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1055,6 +1290,8 @@ def create_infer_and_render_task(req: InferAndRenderRequest) -> TaskInfo:
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1066,6 +1303,8 @@ def create_infer_and_render_task(req: InferAndRenderRequest) -> TaskInfo:
 
 @app.post("/v1/lodge/tasks/infer-from-audio", response_model=TaskInfo)
 def create_infer_from_audio_task(req: InferFromAudioRequest) -> TaskInfo:
+    skin_profiles = _validate_request_skins(req)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1074,6 +1313,8 @@ def create_infer_from_audio_task(req: InferFromAudioRequest) -> TaskInfo:
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1093,6 +1334,8 @@ async def create_infer_from_audio_upload_task(
     device: str = Form(default="0"),
     fps: int = Form(default=30),
     infer_args: str = Form(default=""),
+    skin_ids: Optional[List[str]] = Form(default=None),
+    skin_id: Optional[str] = Form(default=None),
     retarget_enabled: bool = Form(default=False),
     target_fbx: Optional[str] = Form(default=None),
     mapping_file: Optional[str] = Form(default=None),
@@ -1100,6 +1343,8 @@ async def create_infer_from_audio_upload_task(
     retarget_script: Optional[str] = Form(default=None),
     retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
+    skin_profiles = _validate_skin_selection(skin_ids, skin_id, retarget_enabled)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1108,6 +1353,8 @@ async def create_infer_from_audio_upload_task(
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1131,6 +1378,8 @@ async def create_infer_from_audio_upload_task(
         mode=mode,
         device=device,
         fps=fps,
+        skin_ids=requested_skin_ids,
+        skin_id=requested_skin_ids[0],
         retarget_enabled=retarget_enabled,
         target_fbx=target_fbx,
         mapping_file=mapping_file,
@@ -1152,6 +1401,8 @@ async def create_render_from_npy_upload_task(
     mode: str = Form(default="smplx"),
     device: str = Form(default="0"),
     fps: int = Form(default=30),
+    skin_ids: Optional[List[str]] = Form(default=None),
+    skin_id: Optional[str] = Form(default=None),
     retarget_enabled: bool = Form(default=False),
     target_fbx: Optional[str] = Form(default=None),
     mapping_file: Optional[str] = Form(default=None),
@@ -1159,6 +1410,16 @@ async def create_render_from_npy_upload_task(
     retarget_script: Optional[str] = Form(default=None),
     retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
+    skin_profiles = _validate_skin_selection(skin_ids, skin_id, retarget_enabled)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
+    retarget_profile = next(
+        (profile for profile in skin_profiles if skin_requires_retarget(profile)),
+        None,
+    )
+    render_smpl = any(
+        str(profile.get("output_kind") or "") == "smpl"
+        for profile in skin_profiles
+    )
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1167,6 +1428,8 @@ async def create_render_from_npy_upload_task(
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1189,9 +1452,25 @@ async def create_render_from_npy_upload_task(
         device,
         fps,
         {
-            "enabled": retarget_enabled,
-            "target_fbx": target_fbx,
-            "mapping_file": mapping_file,
+            "enabled": retarget_profile is not None,
+            "render_smpl": render_smpl,
+            "skin_id": str(retarget_profile["id"]) if retarget_profile else "",
+            "target_fbx": (
+                target_fbx
+                or (
+                    resolve_skin_resource(PROJECT_ROOT, retarget_profile, "target_fbx")
+                    if retarget_profile
+                    else None
+                )
+            ),
+            "mapping_file": (
+                mapping_file
+                or (
+                    resolve_skin_resource(PROJECT_ROOT, retarget_profile, "mapping_file")
+                    if retarget_profile
+                    else None
+                )
+            ),
             "blender_executable": blender_executable,
             "retarget_script": retarget_script,
             "strict": retarget_strict,
@@ -1210,6 +1489,8 @@ async def create_infer_from_feature_npy_upload_task(
     device: str = Form(default="0"),
     fps: int = Form(default=30),
     infer_args: str = Form(default=""),
+    skin_ids: Optional[List[str]] = Form(default=None),
+    skin_id: Optional[str] = Form(default=None),
     retarget_enabled: bool = Form(default=False),
     target_fbx: Optional[str] = Form(default=None),
     mapping_file: Optional[str] = Form(default=None),
@@ -1217,6 +1498,8 @@ async def create_infer_from_feature_npy_upload_task(
     retarget_script: Optional[str] = Form(default=None),
     retarget_strict: bool = Form(default=False),
 ) -> TaskInfo:
+    skin_profiles = _validate_skin_selection(skin_ids, skin_id, retarget_enabled)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1225,6 +1508,8 @@ async def create_infer_from_feature_npy_upload_task(
         progress=0,
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1246,6 +1531,8 @@ async def create_infer_from_feature_npy_upload_task(
         mode=mode,
         device=device,
         fps=fps,
+        skin_ids=requested_skin_ids,
+        skin_id=requested_skin_ids[0],
         retarget_enabled=retarget_enabled,
         target_fbx=target_fbx,
         mapping_file=mapping_file,
@@ -1267,17 +1554,27 @@ def get_task(task_id: str) -> TaskInfo:
     return task
 
 
+def _selected_task_video_path(task: TaskInfo, skin_id: Optional[str]) -> Path:
+    selected_skin_id = (skin_id or task.skin_id or "smpl").strip()
+    if selected_skin_id != "smpl":
+        retarget_path = task.output_retarget_mp4_path or task.output_retarget_path
+        if task.retarget_status != "succeeded" or not retarget_path:
+            raise HTTPException(status_code=409, detail="Selected skin result not completed")
+        return Path(retarget_path)
+    if task.status != "succeeded" or not task.output_mp4_path:
+        raise HTTPException(status_code=409, detail="Task not completed")
+    return Path(task.output_mp4_path)
+
+
 @app.post("/v1/lodge/tasks/{task_id}/open-output-folder")
-def open_task_output_folder(task_id: str) -> Dict[str, str]:
+def open_task_output_folder(task_id: str, skin_id: Optional[str] = None) -> Dict[str, str]:
     with _task_lock:
         task = _tasks.get(task_id)
 
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status != "succeeded" or not task.output_mp4_path:
-        raise HTTPException(status_code=409, detail="Task not completed")
 
-    mp4_path = Path(task.output_mp4_path)
+    mp4_path = _selected_task_video_path(task, skin_id)
     if not mp4_path.exists():
         raise HTTPException(status_code=410, detail="Output file no longer exists")
 
@@ -1296,16 +1593,14 @@ def open_task_output_folder(task_id: str) -> Dict[str, str]:
 
 
 @app.post("/v1/lodge/tasks/{task_id}/open-output-player")
-def open_task_output_player(task_id: str) -> Dict[str, str]:
+def open_task_output_player(task_id: str, skin_id: Optional[str] = None) -> Dict[str, str]:
     with _task_lock:
         task = _tasks.get(task_id)
 
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status != "succeeded" or not task.output_mp4_path:
-        raise HTTPException(status_code=409, detail="Task not completed")
 
-    mp4_path = Path(task.output_mp4_path)
+    mp4_path = _selected_task_video_path(task, skin_id)
     if not mp4_path.exists():
         raise HTTPException(status_code=410, detail="Output file no longer exists")
 
@@ -1422,7 +1717,7 @@ def download_task_bvh(task_id: str) -> FileResponse:
 
 
 @app.get("/v1/lodge/tasks/{task_id}/download-retarget")
-def download_task_retarget_result(task_id: str) -> FileResponse:
+def download_task_retarget_result(task_id: str, as_attachment: bool = False) -> FileResponse:
     with _task_lock:
         task = _tasks.get(task_id)
 
@@ -1435,7 +1730,16 @@ def download_task_retarget_result(task_id: str) -> FileResponse:
     if not mp4_path.exists():
         raise HTTPException(status_code=410, detail="Retarget output file no longer exists")
 
-    return FileResponse(path=str(mp4_path), media_type="video/mp4", filename=mp4_path.name)
+    disposition = "attachment" if as_attachment else "inline"
+    return FileResponse(
+        path=str(mp4_path),
+        media_type="video/mp4",
+        filename=mp4_path.name if as_attachment else None,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{mp4_path.name}"',
+            "Accept-Ranges": "bytes",
+        },
+    )
 
 if __name__ == "__main__":
     access_log_enabled = os.getenv("LODGE_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}

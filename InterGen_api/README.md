@@ -6,11 +6,14 @@ This folder provides an async HTTP API for text-to-motion generation and optiona
 
 - GET /health
 - POST /translate
+- GET /v1/intergen/skins
 - POST /v1/intergen/tasks/generate
 - POST /v1/intergen/tasks/{task_id}/retry-retarget
 - GET /v1/intergen/tasks/{task_id}
 - GET /v1/intergen/tasks/{task_id}/download
-- GET /v1/intergen/retarget/characters
+- GET /v1/intergen/tasks/{task_id}/download-retarget
+- POST /v1/intergen/tasks/{task_id}/open-output-folder
+- POST /v1/intergen/tasks/{task_id}/open-output-player
 
 Task status values:
 
@@ -21,13 +24,13 @@ Task status values:
 
 ## 2. Run
 
-Option A (recommended in this project):
+Canonical startup entry for this project:
 
-    start_intergen_api.bat
+    start_intergen_api_retarget.bat
 
-Option B (direct):
-
-    python intergen_async_api.py
+All frontend-compatible backend changes must remain reachable through this BAT.
+It configures retarget resources but does not force retarget generation; each
+request's `skin_ids` controls the outputs.
 
 Default port is 8001.
 
@@ -58,12 +61,9 @@ POST /v1/intergen/tasks/generate
 JSON body example:
 
     {
-            "text": "Two people meet, shake hands, and walk together.",
-            "retarget_enabled": true,
-            "target_character_id": "x_bot",
-            "retarget_mapping_profile": "mapping",
-            "retarget_engine": "none",
-            "retarget_strict": false
+      "text": "Two people meet, shake hands, and walk together.",
+      "skin_ids": ["smpl", "robot"],
+      "retarget_strict": false
     }
 
 Typical response:
@@ -73,6 +73,9 @@ Typical response:
       "status": "queued",
       "created_at": "2026-03-27T12:00:00Z",
       "updated_at": "2026-03-27T12:00:00Z",
+      "skin_id": "smpl",
+      "requested_skin_ids": ["smpl", "robot"],
+      "available_skin_ids": [],
       "message": "Task queued",
       "output_mp4_path": null,
       "stderr_tail": ""
@@ -84,15 +87,21 @@ GET /v1/intergen/tasks/{task_id}
 
 Task response includes these retarget fields:
 
+- skin_id
+- requested_skin_ids
+- available_skin_ids
 - output_retarget_path
+- output_retarget_mp4_path
 - retarget_status
 - retarget_message
 
-### 4.3 List retarget characters
+### 4.3 List supported skins
 
-GET /v1/intergen/retarget/characters
+GET /v1/intergen/skins
 
-Typical response includes character_id, fbx existence, and mapping profiles.
+The response is sourced from `config/skin_catalog.json`. It contains the public
+skin id, label, output kind, and backend render mode without exposing local
+resource paths.
 
 ### 4.4 Retry retarget without regenerating motion
 
@@ -109,6 +118,14 @@ This reuses the task's existing two `joints22.npy` files, regenerates BVH, and r
 GET /v1/intergen/tasks/{task_id}/download
 
 Returns video/mp4 when task is succeeded.
+
+For a completed retarget skin:
+
+GET /v1/intergen/tasks/{task_id}/download-retarget
+
+Use `?as_attachment=true` for download; the default response is inline video.
+The two desktop helper endpoints accept an optional `skin_id` query parameter
+so the selected SMPL or retarget file is opened.
 
 ### 4.6 Translate text
 
@@ -187,11 +204,7 @@ This bridge forwards task manifest and file paths to Blender CLI. To enable real
 
 Then start API with:
 
-    start_intergen_api.bat
-
-You can also edit and run:
-
-    start_intergen_api_with_retarget_example.bat
+    start_intergen_api_retarget.bat
 
 Behavior:
 
@@ -220,13 +233,9 @@ Download task result:
 
 ### 1. 启动方式
 
-推荐直接运行：
+统一运行：
 
-    start_intergen_api.bat
-
-或手动运行：
-
-    python intergen_async_api.py
+    start_intergen_api_retarget.bat
 
 默认端口 8001。
 
@@ -234,10 +243,13 @@ Download task result:
 
 - GET /health
 - POST /translate
+- GET /v1/intergen/skins
 - POST /v1/intergen/tasks/generate
 - GET /v1/intergen/tasks/{task_id}
 - GET /v1/intergen/tasks/{task_id}/download
-- GET /v1/intergen/retarget/characters
+- GET /v1/intergen/tasks/{task_id}/download-retarget
+- POST /v1/intergen/tasks/{task_id}/open-output-folder
+- POST /v1/intergen/tasks/{task_id}/open-output-player
 
 ### 3. 任务流
 
@@ -248,8 +260,10 @@ Download task result:
 ### 4. 重要说明
 
 - 当前任务响应包含 progress 字段（0~100）。
-- 创建任务可附带重定向参数：retarget_enabled、target_character_id、retarget_mapping_profile、retarget_engine、retarget_strict。
-- 可通过 GET /v1/intergen/retarget/characters 查看角色配置是否生效。
+- 创建任务使用 `skin_ids` 多选蒙皮；单选只保留对应最终视频，多选才同时生成。
+- `skin_id` 与 `retarget_enabled` 仅用于兼容旧客户端。
+- 可通过 GET /v1/intergen/skins 查看当前服务端蒙皮目录。
+- 任务响应通过 `requested_skin_ids` 和 `available_skin_ids` 回显选择及实际可用结果。
 - 输出目录默认在 InterGen_api/task_runs/{task_id}/output/。
 - 若 SMPL 渲染失败，可能自动回退为火柴人渲染并返回成功状态，同时 message 给出提示。
 
@@ -259,6 +273,6 @@ Download task result:
 
     set INTERGEN_BLENDER_EXE=C:\Program Files\Blender Foundation\Blender 4.2\blender.exe
     set INTERGEN_KEEMAP_SCRIPT=D:\YourPath\blender_keemap_retarget.py
-    start_intergen_api.bat
+    start_intergen_api_retarget.bat
 
 说明：INTERGEN_KEEMAP_SCRIPT 是你自己的 Blender 自动化脚本，内部负责调用 KeeMap 插件完成 BVH->FBX 重定向，并导出 --output 指定的视频文件。

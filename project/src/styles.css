@@ -213,7 +213,7 @@ body {
   background: var(--panel-strong);
   padding: 10px 12px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 8px;
 }
 
@@ -435,6 +435,8 @@ body {
 }
 
 .composer textarea {
+  flex: 1;
+  min-width: 0;
   border: none;
   width: 100%;
   resize: none;
@@ -564,6 +566,8 @@ body {
 
 @media (max-width: 640px) {
   .chat-panel {
+    width: 100%;
+    min-width: 0;
     padding: 14px;
     gap: 12px;
   }

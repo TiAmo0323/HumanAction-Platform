@@ -90,8 +90,19 @@
           </div>
         </header>
 
+        <SkinSelector
+          :model-value="selectedSkinIds"
+          :options="skinOptions"
+          :disabled="isGenerating"
+          @update:model-value="selectSkins"
+        />
+
         <section class="generation-stage" :class="{ generating: isGenerating }">
           <div class="stage-frame" aria-label="动画展示区">
+            <div class="stage-skin-badge">
+              <span></span>
+              {{ displayedSkinOption.label }} 蒙皮
+            </div>
             <video
               v-if="generatedVideoUrl"
               ref="generatedVideoRef"
@@ -101,6 +112,11 @@
               playsinline
               preload="metadata"
             ></video>
+            <div v-else class="stage-empty-state">
+              <span class="stage-empty-orb"></span>
+              <strong>等待生成 {{ selectedSkinSummary }} 动画</strong>
+              <small>输入文本或上传音频后开始生成</small>
+            </div>
           </div>
         </section>
 
@@ -111,6 +127,20 @@
           <span class="progress-value">{{ generationProgress }}%</span>
         </section>
         <p class="task-status" v-if="taskStatusText">{{ taskStatusText }}</p>
+        <p class="skin-result-notice" v-if="skinResultNotice">{{ skinResultNotice }}</p>
+        <div v-if="generatedAvailableSkinIds.length > 1" class="result-skin-switch" aria-label="切换已生成的蒙皮视频">
+          <span>查看结果：</span>
+          <button
+            v-for="skinId in generatedAvailableSkinIds"
+            :key="skinId"
+            type="button"
+            class="ghost-btn"
+            :class="{ active: generatedSkinId === skinId }"
+            @click="applyGeneratedSkin(skinId)"
+          >
+            {{ resolveSkinOption(skinId).label }}
+          </button>
+        </div>
         <div class="video-actions" v-if="generatedVideoUrl">
           <button type="button" class="ghost-btn" @click="openVideoInNewTab">打开播放页</button>
           <button type="button" class="ghost-btn" @click="downloadGeneratedVideo">下载视频</button>
@@ -185,8 +215,14 @@
 </template>
 
 <script setup>
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import axios from 'axios'
+import SkinSelector from './components/SkinSelector.vue'
+import {
+  DEFAULT_SKIN_ID,
+  getSkinOption,
+  skinOptions as defaultSkinOptions
+} from './config/skinOptions'
 
 const runtimeHost = (import.meta.env.VITE_API_HOST || (typeof window !== 'undefined' ? window.location.hostname : '47.116.49.93') || '47.116.49.93').trim()
 const runtimeProtocol = (import.meta.env.VITE_API_PROTOCOL || (typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http') || 'http').trim().toLowerCase()
@@ -196,7 +232,6 @@ const intergenApiBase = (import.meta.env.VITE_INTERGEN_API_BASE || `${apiProtoco
 const lodgeApiBase = (import.meta.env.VITE_LODGE_API_BASE || `${apiProtocol}://${runtimeHost}:8002`).replace(/\/$/, '')
 const lodgeRoot = (import.meta.env.VITE_LODGE_ROOT || 'D:/HumanAction_Platform/LODGE-main').trim()
 const lodgePythonExecutable = (import.meta.env.VITE_LODGE_PYTHON_EXECUTABLE || '').trim()
-const lodgeRetargetEnabled = String(import.meta.env.VITE_LODGE_RETARGET_ENABLED || '').trim().toLowerCase() === 'true'
 const lodgeBlenderExecutable = (import.meta.env.VITE_LODGE_BLENDER_EXE || '').trim()
 const lodgeTargetFbx = (import.meta.env.VITE_LODGE_TARGET_FBX || '').trim()
 const lodgeRetargetMapping = (import.meta.env.VITE_LODGE_RETARGET_MAPPING || '').trim()
@@ -217,6 +252,12 @@ const generatedVideoRef = ref(null)
 const uploadStatus = ref('')
 const isUploadReady = ref(false)
 const taskStatusText = ref('')
+const skinOptions = ref([...defaultSkinOptions])
+const selectedSkinIds = ref([DEFAULT_SKIN_ID])
+const activeTaskSkinIds = ref([])
+const generatedSkinId = ref('')
+const generatedOutputs = ref({})
+const skinResultNotice = ref('')
 
 const generatedVideoUrl = ref('')
 const generatedVideoDownloadUrl = ref('')
@@ -232,7 +273,87 @@ const resolutions = [
   { label: '2K', value: '2k' }
 ]
 
+const resolveSkinOption = (skinId) => getSkinOption(skinId, skinOptions.value)
+const skinLabels = (skinIds) => skinIds.map((skinId) => resolveSkinOption(skinId).label).join(' + ')
+const selectedSkinSummary = computed(() => skinLabels(selectedSkinIds.value))
+const displayedSkinOption = computed(() => resolveSkinOption(generatedSkinId.value || selectedSkinIds.value[0]))
+const generatedAvailableSkinIds = computed(() =>
+  Object.entries(generatedOutputs.value)
+    .filter(([, output]) => output?.available)
+    .map(([skinId]) => skinId)
+)
+
 const history = ref([])
+
+const loadBackendSkinCatalog = async () => {
+  const results = await Promise.allSettled([
+    axios.get(`${intergenApiBase}/v1/intergen/skins`),
+    axios.get(`${lodgeApiBase}/v1/lodge/skins`)
+  ])
+  const catalog = results
+    .filter((result) => result.status === 'fulfilled')
+    .map((result) => result.value.data)
+    .find((payload) => Array.isArray(payload?.skins) && payload.skins.length)
+
+  if (!catalog) return
+
+  skinOptions.value = catalog.skins.map((skin) => ({
+    id: skin.id,
+    label: skin.label || skin.id,
+    category: skin.category || '角色蒙皮',
+    description: skin.description || '',
+    outputKind: skin.output_kind,
+    backendMode: skin.backend_mode || 'smplx'
+  }))
+
+  selectedSkinIds.value = selectedSkinIds.value.filter((skinId) =>
+    skinOptions.value.some((skin) => skin.id === skinId)
+  )
+  if (!selectedSkinIds.value.length) {
+    selectedSkinIds.value = [catalog.default_skin_id || DEFAULT_SKIN_ID]
+  }
+}
+
+onMounted(() => {
+  loadBackendSkinCatalog()
+})
+
+const applyGeneratedSkin = (skinId, updateStatus = true) => {
+  const skin = resolveSkinOption(skinId)
+  const output = generatedOutputs.value[skin.id]
+  if (!output?.available) {
+    return false
+  }
+
+  generatedVideoUrl.value = output.url
+  generatedVideoDownloadUrl.value = output.downloadUrl || output.url
+  generatedVideoFilePath.value = output.filePath || ''
+  generatedSkinId.value = skin.id
+  skinResultNotice.value = `当前展示：${skin.label} 蒙皮。你可以直接切换其他已生成的蒙皮结果。`
+  if (updateStatus) {
+    taskStatusText.value = `已切换到 ${skin.label} 蒙皮结果。`
+  }
+  return true
+}
+
+const selectSkins = (skinIds) => {
+  const previousIds = selectedSkinIds.value
+  selectedSkinIds.value = [...skinIds]
+  if (isGenerating.value || !generatedTaskId.value) {
+    skinResultNotice.value = isGenerating.value
+      ? `任务生成期间已锁定为 ${skinLabels(activeTaskSkinIds.value)}。`
+      : ''
+    return
+  }
+
+  const addedSkinId = skinIds.find((skinId) => !previousIds.includes(skinId))
+  const displaySkinId = addedSkinId || skinIds.find((skinId) => generatedOutputs.value[skinId]?.available)
+  if (displaySkinId && !applyGeneratedSkin(displaySkinId)) {
+    const skin = resolveSkinOption(displaySkinId)
+    const output = generatedOutputs.value[displaySkinId]
+    skinResultNotice.value = output?.reason || `${skin.label} 未在当前任务中生成，请重新提交任务。`
+  }
+}
 
 const addHistoryItem = (title) => {
   history.value.unshift({
@@ -263,6 +384,10 @@ const startNewChat = () => {
   generatedVideoFilePath.value = ''
   generatedTaskId.value = ''
   generatedTaskBaseUrl.value = ''
+  activeTaskSkinIds.value = []
+  generatedSkinId.value = ''
+  generatedOutputs.value = {}
+  skinResultNotice.value = ''
   uploadStatus.value = ''
   isUploadReady.value = false
   taskStatusText.value = ''
@@ -291,6 +416,13 @@ const sendMessage = async () => {
   generationProgress.value = 10
   taskStatusText.value = '任务已提交，等待后端开始处理...'
   const currentPrompt = prompt.value
+  const requestedSkinIds = [...selectedSkinIds.value]
+  const requestedSkins = requestedSkinIds.map(resolveSkinOption)
+  const requestedSkin = requestedSkins[0]
+  const requestedSkinSummary = skinLabels(requestedSkinIds)
+  const requestsRetarget = requestedSkins.some((skin) => skin.outputKind === 'retarget')
+  activeTaskSkinIds.value = requestedSkinIds
+  skinResultNotice.value = `本次任务只生成：${requestedSkinSummary}`
   prompt.value = ''
 
   try {
@@ -299,8 +431,13 @@ const sendMessage = async () => {
     
     if (inputMode.value === 'text') {
       apiUrl = `${intergenApiBase}/v1/intergen/tasks/generate`
-      payload = { text: currentPrompt }
-      addHistoryItem(`文本驱动: ${currentPrompt}`)
+      payload = {
+        text: currentPrompt,
+        skin_ids: requestedSkinIds,
+        skin_id: requestedSkin.id,
+        retarget_enabled: requestsRetarget
+      }
+      addHistoryItem(`文本驱动 · ${requestedSkinSummary}: ${currentPrompt}`)
     } 
     else if (inputMode.value === 'music') {
       if (!selectedMusicFileObj.value) {
@@ -321,10 +458,12 @@ const sendMessage = async () => {
       const formData = new FormData()
       formData.append('lodge_root', lodgeRoot)
       formData.append('song_id', musicId)
-      formData.append('mode', 'smplx')
+      formData.append('mode', requestedSkin.backendMode)
       formData.append('device', '0')
       formData.append('fps', '30')
-      formData.append('retarget_enabled', lodgeRetargetEnabled ? 'true' : 'false')
+      requestedSkinIds.forEach((skinId) => formData.append('skin_ids', skinId))
+      formData.append('skin_id', requestedSkin.id)
+      formData.append('retarget_enabled', requestsRetarget ? 'true' : 'false')
       if (lodgePythonExecutable) {
         formData.append('python_executable', lodgePythonExecutable)
       }
@@ -350,7 +489,7 @@ const sendMessage = async () => {
       }
 
       payload = formData
-      addHistoryItem(`音乐驱动 (编号): ${musicId}`)
+      addHistoryItem(`音乐驱动 · ${requestedSkinSummary}: ${musicId}`)
     } 
     else if (inputMode.value === 'voice') {
       window.alert('语音功能暂未开放，请尝试文字或音乐输入。')
@@ -369,7 +508,7 @@ const sendMessage = async () => {
     const baseUrl = apiUrl.substring(0, apiUrl.lastIndexOf('/tasks') + 6)
 
     // 启动轮询：因为 8001/8002 都是异步生成，需要不断问“好了没”
-    startPolling(taskId, baseUrl)
+    startPolling(taskId, baseUrl, requestedSkinIds)
 
 
   } catch (error) {
@@ -385,7 +524,7 @@ const handleComposerEnter = () => {
   sendMessage()
 }
 
-const startPolling = (taskId, baseUrl) => {
+const startPolling = (taskId, baseUrl, requestedSkinIds) => {
   // 清除可能存在的旧定时器
   if (window.pollTimer) clearInterval(window.pollTimer)
 
@@ -407,17 +546,68 @@ const startPolling = (taskId, baseUrl) => {
         window.pollTimer = null
         generationProgress.value = 100
         isGenerating.value = false
-        taskStatusText.value = '任务已完成，视频可播放或下载。'
+        const requestedSummary = skinLabels(requestedSkinIds)
+        taskStatusText.value = `任务已完成，已按选择生成：${requestedSummary}。`
 
-        // 设置生成的视频地址 (供页面上的 <video> 标签使用)
-        const hasRetargetVideo = task.retarget_status === 'succeeded' && task.output_retarget_mp4_path
-        generatedVideoUrl.value = hasRetargetVideo ? `${baseUrl}/${taskId}/download-retarget` : `${baseUrl}/${taskId}/download`
-        generatedVideoDownloadUrl.value = hasRetargetVideo ? `${baseUrl}/${taskId}/download-retarget` : `${baseUrl}/${taskId}/download?as_attachment=true`
-        generatedVideoFilePath.value = hasRetargetVideo ? task.output_retarget_mp4_path : (task.output_mp4_path || '')
+        const retargetPath = task.output_retarget_mp4_path || task.output_retarget_path || ''
+        const retargetSucceeded = task.retarget_status === 'succeeded' && Boolean(retargetPath)
+        const taskRequestedSkinIds = task.requested_skin_ids?.length
+          ? task.requested_skin_ids
+          : requestedSkinIds
+        const taskSkinId = task.skin_id || taskRequestedSkinIds[0]
+        const retargetSkinId = (task.available_skin_ids || []).find((skinId) => skinId !== 'smpl')
+          || (taskSkinId !== 'smpl' ? taskSkinId : 'robot')
+        const outputs = {}
+        if (task.output_mp4_path) {
+          outputs.smpl = {
+            available: Boolean(task.output_mp4_path),
+            url: `${baseUrl}/${taskId}/download`,
+            downloadUrl: `${baseUrl}/${taskId}/download?as_attachment=true`,
+            filePath: task.output_mp4_path || ''
+          }
+        }
+        if (retargetSucceeded) {
+          outputs[retargetSkinId] = {
+            available: retargetSucceeded,
+            generated: retargetSucceeded,
+            url: `${baseUrl}/${taskId}/download-retarget`,
+            downloadUrl: `${baseUrl}/${taskId}/download-retarget?as_attachment=true`,
+            filePath: retargetPath,
+            reason: '本次任务没有生成可播放的机器人重定向视频。'
+          }
+        }
+        taskRequestedSkinIds.forEach((skinId) => {
+          if (!outputs[skinId]) {
+            outputs[skinId] = {
+              available: false,
+              reason: `${resolveSkinOption(skinId).label} 未成功生成。`
+            }
+          }
+        })
+        generatedOutputs.value = outputs
         generatedTaskId.value = taskId
         generatedTaskBaseUrl.value = baseUrl
+        const initialSkinId = requestedSkinIds.find((skinId) => outputs[skinId]?.available)
+        if (initialSkinId) {
+          applyGeneratedSkin(initialSkinId, false)
+          const missingSkinIds = requestedSkinIds.filter((skinId) => !outputs[skinId]?.available)
+          if (missingSkinIds.length) {
+            skinResultNotice.value = `当前展示：${resolveSkinOption(initialSkinId).label}；未成功生成：${skinLabels(missingSkinIds)}。`
+            taskStatusText.value = '任务部分完成，请查看未成功生成的蒙皮状态。'
+          }
+        } else {
+          generatedVideoUrl.value = ''
+          generatedVideoDownloadUrl.value = ''
+          generatedVideoFilePath.value = ''
+          skinResultNotice.value = '后端没有返回任何已选择蒙皮的可播放视频。'
+          taskStatusText.value = '任务结束，但所选蒙皮均未成功生成。'
+        }
 
         console.log("生成成功！视频地址：", generatedVideoUrl.value)
+        if (!generatedVideoUrl.value) {
+          window.alert('任务结束，但所选蒙皮没有生成可播放视频，请查看任务状态信息。')
+          return
+        }
 
         const shouldOpenPlayer = window.confirm('视频已生成完毕。点击“确定”将直接调用系统默认 MP4 播放器播放；点击“取消”进入下载选项。')
         if (shouldOpenPlayer) {
@@ -529,7 +719,11 @@ const openVideoWithSystemPlayer = async () => {
   }
 
   try {
-    await axios.post(`${generatedTaskBaseUrl.value}/${generatedTaskId.value}/open-output-player`)
+    await axios.post(
+      `${generatedTaskBaseUrl.value}/${generatedTaskId.value}/open-output-player`,
+      null,
+      { params: { skin_id: generatedSkinId.value || selectedSkinIds.value[0] } }
+    )
   } catch (err) {
     console.error('调用系统播放器失败:', err)
     window.alert('调用系统播放器失败，将为你打开网页播放页作为备用方案。')
@@ -570,7 +764,11 @@ const openVideoFolder = async () => {
   }
 
   try {
-    await axios.post(`${generatedTaskBaseUrl.value}/${generatedTaskId.value}/open-output-folder`)
+    await axios.post(
+      `${generatedTaskBaseUrl.value}/${generatedTaskId.value}/open-output-folder`,
+      null,
+      { params: { skin_id: generatedSkinId.value || selectedSkinIds.value[0] } }
+    )
   } catch (err) {
     console.error('打开视频文件夹失败:', err)
     if (generatedVideoFilePath.value) {
@@ -592,5 +790,82 @@ const saveRender = async () => {
   gap: 10px;
   margin: 8px 0 14px;
   flex-wrap: wrap;
+}
+
+.result-skin-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  color: #66736b;
+  font-size: 0.78rem;
+}
+
+.result-skin-switch .ghost-btn.active {
+  border-color: rgba(31, 143, 98, 0.58);
+  background: rgba(31, 143, 98, 0.1);
+  color: #176d4b;
+}
+
+.stage-skin-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  background: rgba(18, 37, 26, 0.7);
+  color: #fff;
+  font-size: 0.74rem;
+  font-weight: 700;
+  backdrop-filter: blur(8px);
+}
+
+.stage-skin-badge span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #67dda5;
+  box-shadow: 0 0 0 3px rgba(103, 221, 165, 0.18);
+}
+
+.stage-empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: #53675a;
+  text-align: center;
+}
+
+.stage-empty-state strong {
+  margin-top: 12px;
+  font-size: 0.92rem;
+}
+
+.stage-empty-state small {
+  margin-top: 4px;
+  color: #7a8a80;
+  font-size: 0.74rem;
+}
+
+.stage-empty-orb {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #fff 0 12%, #7fd2ae 20%, #1f8f62 68%, #176645 100%);
+  box-shadow: 0 12px 26px rgba(31, 143, 98, 0.24);
+}
+
+.skin-result-notice {
+  margin: -2px 2px 2px;
+  color: #1f7955;
+  font-size: 0.78rem;
+  font-weight: 600;
 }
 </style>

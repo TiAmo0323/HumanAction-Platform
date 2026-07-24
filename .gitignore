@@ -36,6 +36,9 @@ logs/
 *.log
 *.pid
 
+# Local project-growth archive (contains task evidence and internal reports)
+docs/project-growth/
+
 # Generated motion, media, Blender, and character files
 *.npy
 *.npz

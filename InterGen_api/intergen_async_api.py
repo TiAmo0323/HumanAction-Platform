@@ -94,6 +94,14 @@ if INTERGEN_CONFIG_DIR:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from shared.skin_catalog import (
+    SkinCatalogError,
+    public_skin_catalog,
+    resolve_skin_resource,
+    resolve_skins,
+    skin_requires_retarget,
+)
+
 from collections import OrderedDict
 from os.path import join as pjoin
 
@@ -123,6 +131,14 @@ except Exception:
 
 class GenerateMotionRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text prompt for two-person motion generation")
+    skin_ids: Optional[List[str]] = Field(
+        default=None,
+        description="One or more requested skin ids; takes precedence over legacy skin_id",
+    )
+    skin_id: Optional[str] = Field(
+        default=None,
+        description="Requested skin id from config/skin_catalog.json; defaults to smpl",
+    )
     num_samples: Optional[int] = Field(default=None, ge=1, le=8, description="Number of candidates to sample before selecting best")
     motion_frames: Optional[int] = Field(
         default=None,
@@ -140,6 +156,10 @@ class GenerateMotionRequest(BaseModel):
 
 
 class RetryRetargetRequest(BaseModel):
+    skin_id: Optional[str] = Field(
+        default="robot",
+        description="Requested retarget skin id from config/skin_catalog.json",
+    )
     retarget_strict: bool = Field(default=False, description="Fail the retry if retargeting fails")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
     mapping_file: Optional[str] = Field(default=None, description="Rokoko bone mapping JSON path")
@@ -161,12 +181,16 @@ class TaskInfo(BaseModel):
     status: str
     created_at: str
     updated_at: str
+    skin_id: str = "smpl"
+    requested_skin_ids: List[str] = Field(default_factory=lambda: ["smpl"])
+    available_skin_ids: List[str] = Field(default_factory=list)
     message: str = ""
     progress: int = 0
     final_prompt: str = ""
     output_mp4_path: Optional[str] = None
     output_bvh_path: Optional[str] = None
     output_retarget_path: Optional[str] = None
+    output_retarget_mp4_path: Optional[str] = None
     generated_frames: Optional[int] = None
     fps: Optional[int] = None
     duration_seconds: Optional[float] = None
@@ -840,8 +864,12 @@ def _run_intergen_retarget_if_requested(
     req: GenerateMotionRequest,
     motion_prompt: str = "",
 ) -> None:
-    enabled = bool(req.retarget_enabled) or _env_flag("INTERGEN_RETARGET_ENABLED", False)
-    if not enabled:
+    requested_profiles = _resolve_request_skins(req)
+    skin_profile = next(
+        (profile for profile in requested_profiles if skin_requires_retarget(profile)),
+        None,
+    )
+    if skin_profile is None:
         _update_task(task_id, retarget_status="skipped", retarget_message="Retarget disabled")
         return
 
@@ -867,8 +895,18 @@ def _run_intergen_retarget_if_requested(
         return
 
     blender_exe = _resolve_optional_path(req.blender_executable, "INTERGEN_BLENDER_EXE")
-    target_fbx = _resolve_optional_path(req.target_fbx, "INTERGEN_TARGET_FBX", _default_target_fbx())
-    mapping_file = _resolve_optional_path(req.mapping_file, "INTERGEN_RETARGET_MAPPING", _default_mapping_file())
+    profile_target_fbx = resolve_skin_resource(PROJECT_ROOT, skin_profile, "target_fbx")
+    profile_mapping_file = resolve_skin_resource(PROJECT_ROOT, skin_profile, "mapping_file")
+    target_fbx = _resolve_optional_path(
+        req.target_fbx,
+        "INTERGEN_TARGET_FBX",
+        profile_target_fbx or _default_target_fbx(),
+    )
+    mapping_file = _resolve_optional_path(
+        req.mapping_file,
+        "INTERGEN_RETARGET_MAPPING",
+        profile_mapping_file or _default_mapping_file(),
+    )
     retarget_script = _resolve_optional_path(req.retarget_script, "INTERGEN_RETARGET_SCRIPT", _default_retarget_script())
 
     retarget_dir = task_root / "retarget"
@@ -885,6 +923,7 @@ def _run_intergen_retarget_if_requested(
     motion_profile, target_spacing = _resolve_retarget_spacing(effective_motion_prompt)
     manifest = {
         "task_id": task_id,
+        "skin_id": str(skin_profile["id"]),
         "engine": "blender-rokoko",
         "source_bvh": str(source_bvhs[0].resolve()),
         "source_bvh_files": [str(path.resolve()) for path in source_bvhs],
@@ -1275,6 +1314,36 @@ _tasks: Dict[str, TaskInfo] = {}
 _task_lock = threading.Lock()
 
 
+def _resolve_request_skins(req) -> List[Dict[str, object]]:
+    return resolve_skins(
+        PROJECT_ROOT,
+        getattr(req, "skin_ids", None),
+        skin_id=getattr(req, "skin_id", None),
+        legacy_retarget_enabled=bool(getattr(req, "retarget_enabled", False)),
+    )
+
+
+def _resolve_request_skin(req) -> Dict[str, object]:
+    return _resolve_request_skins(req)[0]
+
+
+def _validate_request_skins(req, require_retarget: bool = False) -> List[Dict[str, object]]:
+    try:
+        profiles = _resolve_request_skins(req)
+    except SkinCatalogError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if require_retarget and not any(skin_requires_retarget(profile) for profile in profiles):
+        raise HTTPException(
+            status_code=422,
+            detail="At least one requested skin must be a retarget skin",
+        )
+    return profiles
+
+
+def _validate_request_skin(req, require_retarget: bool = False) -> Dict[str, object]:
+    return _validate_request_skins(req, require_retarget=require_retarget)[0]
+
+
 def _update_task(task_id: str, **kwargs) -> None:
     with _task_lock:
         task = _tasks.get(task_id)
@@ -1285,6 +1354,21 @@ def _update_task(task_id: str, **kwargs) -> None:
         else:
             data = task.dict()
         data.update(kwargs)
+        retarget_path = data.get("output_retarget_mp4_path") or data.get("output_retarget_path")
+        if retarget_path:
+            data["output_retarget_path"] = retarget_path
+            data["output_retarget_mp4_path"] = retarget_path
+        available_skin_ids = []
+        if data.get("output_mp4_path"):
+            available_skin_ids.append("smpl")
+        if data.get("retarget_status") == "succeeded" and retarget_path:
+            requested_skin_ids = list(data.get("requested_skin_ids") or [])
+            retarget_skin_id = next(
+                (skin_id for skin_id in requested_skin_ids if skin_id != "smpl"),
+                "robot",
+            )
+            available_skin_ids.append(retarget_skin_id)
+        data["available_skin_ids"] = available_skin_ids
         data["updated_at"] = _utc_now()
         _tasks[task_id] = TaskInfo(**data)
 
@@ -1394,6 +1478,16 @@ def _prepare_prompt_for_model(text: str) -> str:
 
 def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
     try:
+        requested_profiles = _resolve_request_skins(req)
+        requested_skin_ids = [str(profile["id"]) for profile in requested_profiles]
+        smpl_requested = any(
+            str(profile.get("output_kind") or "") == "smpl"
+            for profile in requested_profiles
+        )
+        retarget_requested = any(
+            skin_requires_retarget(profile)
+            for profile in requested_profiles
+        )
         _update_task(task_id, status="running", message="Translating prompt...", progress=10)
         final_prompt = _prepare_prompt_for_model(req.text)
 
@@ -1434,13 +1528,34 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             motion_prompt=final_prompt,
         )
 
+        if not smpl_requested:
+            if output_path.exists():
+                output_path.unlink()
+            candidate_dir = output_path.parent / "candidates"
+            if candidate_dir.is_dir():
+                for candidate_mp4 in candidate_dir.glob("*.mp4"):
+                    candidate_mp4.unlink()
+
+        with _task_lock:
+            current_task = _tasks.get(task_id)
+        retarget_succeeded = bool(
+            current_task
+            and current_task.retarget_status == "succeeded"
+            and (current_task.output_retarget_mp4_path or current_task.output_retarget_path)
+        )
+        if retarget_requested and not retarget_succeeded and not smpl_requested:
+            reason = current_task.retarget_message if current_task else "Retarget state unavailable"
+            raise RuntimeError(f"Requested retarget skin was not generated: {reason}")
+        if retarget_requested and not retarget_succeeded:
+            task_message = f"{task_message} Retarget output failed; SMPL output is available."
+
         _update_task(
             task_id,
             status="succeeded",
             message=task_message,
             progress=100,
             final_prompt=final_prompt,
-            output_mp4_path=str(output_path.resolve()),
+            output_mp4_path=str(output_path.resolve()) if smpl_requested else None,
             generated_frames=generated_frames,
             fps=generated_fps,
             duration_seconds=duration_seconds,
@@ -1514,6 +1629,7 @@ def _run_retry_retarget_task(task_id: str, req: RetryRetargetRequest) -> None:
                     retry_motion_prompt = ""
         retarget_req = GenerateMotionRequest(
             text="Retry existing InterGen motion retarget",
+            skin_id=req.skin_id,
             retarget_enabled=True,
             retarget_strict=req.retarget_strict,
             target_fbx=req.target_fbx,
@@ -1602,8 +1718,18 @@ def translate(req: TranslateRequest) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@app.get("/v1/intergen/skins")
+def get_supported_skins() -> Dict[str, object]:
+    try:
+        return public_skin_catalog(PROJECT_ROOT)
+    except SkinCatalogError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/v1/intergen/tasks/generate", response_model=TaskInfo)
 def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
+    skin_profiles = _validate_request_skins(req)
+    requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1611,6 +1737,8 @@ def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
         status="queued",
         created_at=now,
         updated_at=now,
+        skin_id=requested_skin_ids[0],
+        requested_skin_ids=requested_skin_ids,
         message="Task queued",
     )
     with _task_lock:
@@ -1622,6 +1750,7 @@ def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
 
 @app.post("/v1/intergen/tasks/{task_id}/retry-retarget", response_model=TaskInfo)
 def retry_task_retarget(task_id: str, req: RetryRetargetRequest) -> TaskInfo:
+    skin_profile = _validate_request_skin(req, require_retarget=True)
     try:
         _, output_path, _ = _existing_task_motion_files(task_id)
     except ValueError as exc:
@@ -1637,12 +1766,15 @@ def retry_task_retarget(task_id: str, req: RetryRetargetRequest) -> TaskInfo:
             status="queued",
             created_at=existing.created_at if existing else now,
             updated_at=now,
+            skin_id=str(skin_profile["id"]),
+            requested_skin_ids=[str(skin_profile["id"])],
             message="Retarget retry queued",
             progress=65,
             final_prompt=existing.final_prompt if existing else "",
             output_mp4_path=str(output_path.resolve()),
             output_bvh_path=existing.output_bvh_path if existing else None,
             output_retarget_path=None,
+            output_retarget_mp4_path=None,
             generated_frames=existing.generated_frames if existing else None,
             fps=existing.fps if existing else None,
             duration_seconds=existing.duration_seconds if existing else None,
@@ -1664,6 +1796,65 @@ def get_task(task_id: str) -> TaskInfo:
     return task
 
 
+def _selected_task_video_path(task: TaskInfo, skin_id: Optional[str]) -> Path:
+    selected_skin_id = (skin_id or task.skin_id or "smpl").strip()
+    if selected_skin_id != "smpl":
+        retarget_path = task.output_retarget_mp4_path or task.output_retarget_path
+        if task.retarget_status != "succeeded" or not retarget_path:
+            raise HTTPException(status_code=409, detail="Selected skin result not completed")
+        return Path(retarget_path)
+    if task.status != "succeeded" or not task.output_mp4_path:
+        raise HTTPException(status_code=409, detail="Task not completed")
+    return Path(task.output_mp4_path)
+
+
+@app.post("/v1/intergen/tasks/{task_id}/open-output-folder")
+def open_task_output_folder(task_id: str, skin_id: Optional[str] = None) -> Dict[str, str]:
+    with _task_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    mp4_path = _selected_task_video_path(task, skin_id)
+    if not mp4_path.exists():
+        raise HTTPException(status_code=410, detail="Output file no longer exists")
+
+    parent_dir = mp4_path.parent
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", f"/select,{str(mp4_path)}"])  # nosec B603
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(parent_dir)])  # nosec B603
+        else:
+            subprocess.Popen(["xdg-open", str(parent_dir)])  # nosec B603
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open folder: {exc}") from exc
+    return {"status": "ok", "opened_path": str(parent_dir)}
+
+
+@app.post("/v1/intergen/tasks/{task_id}/open-output-player")
+def open_task_output_player(task_id: str, skin_id: Optional[str] = None) -> Dict[str, str]:
+    with _task_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    mp4_path = _selected_task_video_path(task, skin_id)
+    if not mp4_path.exists():
+        raise HTTPException(status_code=410, detail="Output file no longer exists")
+
+    try:
+        if os.name == "nt":
+            os.startfile(str(mp4_path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(mp4_path)])  # nosec B603
+        else:
+            subprocess.Popen(["xdg-open", str(mp4_path)])  # nosec B603
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open player: {exc}") from exc
+    return {"status": "ok", "opened_file": str(mp4_path)}
+
+
 @app.get("/v1/intergen/tasks/{task_id}/download")
 def download_task_result(task_id: str) -> FileResponse:
     with _task_lock:
@@ -1682,6 +1873,33 @@ def download_task_result(task_id: str) -> FileResponse:
         path=str(mp4_path),
         media_type="video/mp4",
         filename=mp4_path.name,
+    )
+
+
+@app.get("/v1/intergen/tasks/{task_id}/download-retarget")
+def download_task_retarget_result(task_id: str, as_attachment: bool = False) -> FileResponse:
+    with _task_lock:
+        task = _tasks.get(task_id)
+
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    retarget_path = task.output_retarget_mp4_path or task.output_retarget_path
+    if task.retarget_status != "succeeded" or not retarget_path:
+        raise HTTPException(status_code=409, detail="Retarget result not completed")
+
+    mp4_path = Path(retarget_path)
+    if not mp4_path.exists():
+        raise HTTPException(status_code=410, detail="Retarget output file no longer exists")
+
+    disposition = "attachment" if as_attachment else "inline"
+    return FileResponse(
+        path=str(mp4_path),
+        media_type="video/mp4",
+        filename=mp4_path.name if as_attachment else None,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{mp4_path.name}"',
+            "Accept-Ranges": "bytes",
+        },
     )
 
 

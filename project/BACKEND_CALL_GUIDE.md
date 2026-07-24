@@ -28,6 +28,24 @@
 - 前端分辨率选项 `720p/1080p/2k` 目前只用于 UI 展示，未传入后端。
 - 文件上传后会强制切到 `music` 流程，避免落在 `voice` 模式导致无法提交。
 
+### 2.1 蒙皮选择
+
+前端启动后会并行读取 `GET /v1/intergen/skins` 和
+`GET /v1/lodge/skins`，后端不可用时回退到
+`src/config/skinOptions.js` 的内置列表。当前提供：
+
+| 选项 | 输出类型 | 请求行为 |
+|---|---|---|
+| SMPL | `smpl` | 勾选时生成普通 SMPL / SMPL-X 视频 |
+| 机器人 | `retarget` | 勾选时执行 Blender/Rokoko 重定向并生成机器人视频 |
+
+至少选择一项。选择会在任务提交时锁定：单选只生成对应最终视频，多选才
+生成多种最终视频。多选任务完成后可通过结果切换按钮查看不同蒙皮。
+
+新增其他蒙皮时，优先在项目级 `config/skin_catalog.json` 增加配置，不要在
+`App.vue` 中复制按钮。InterGen 与 LODGE 均已提供
+`/download-retarget`，文本和音频任务都可以在线选择并播放机器人结果。
+
 ## 3. InterGen API（文本生成）
 
 ### 3.1 提交任务
@@ -38,9 +56,14 @@
 
 ```json
 {
-  "text": "两个人相遇，握手后并排向前行走。"
+  "text": "两个人相遇，握手后并排向前行走。",
+  "skin_ids": ["smpl", "robot"],
+  "skin_id": "robot",
+  "retarget_enabled": true
 }
 ```
+
+`skin_ids` 是当前正式字段；`skin_id` 和 `retarget_enabled` 仅为旧客户端保留。
 
 返回示例：
 
@@ -73,6 +96,10 @@
 
 返回 `video/mp4`。
 
+机器人或其他重定向蒙皮：
+
+`GET /v1/intergen/tasks/{task_id}/download-retarget`
+
 ### 3.4 其他可用接口
 
 - `GET /health`
@@ -92,6 +119,9 @@
     - `mode`（默认 `smplx`）
     - `device`（默认 `0`）
     - `fps`（默认 `30`）
+    - `skin_ids`（可重复表单字段，当前值为 `smpl`、`robot`）
+    - `skin_id`（兼容旧前端）
+    - `retarget_enabled`（兼容旧前端；新逻辑以 `skin_ids` 为准）
 - 特征文件（`npy`）：
   - `POST /v1/lodge/tasks/infer-from-feature-npy-upload`
   - 字段与上面类似，文件字段为 `npy_file`
@@ -117,7 +147,9 @@ LODGE 任务对象包含 `progress` 字段（0-100），前端会优先使用该
 - `POST /v1/lodge/tasks/{task_id}/open-output-player`
 - `POST /v1/lodge/tasks/{task_id}/open-output-folder`
 
-说明：这两个接口会在后端机器上执行系统命令打开播放器/文件夹，适合本机部署联调场景。
+前端会附带当前实际播放结果的 `skin_id` 查询参数。InterGen 也提供同名
+辅助接口。它们会在后端机器上执行系统命令打开所选蒙皮对应的播放器或
+文件夹，适合本机部署联调场景。
 
 ### 4.4 LODGE 其他可用接口（当前前端未直接调用）
 

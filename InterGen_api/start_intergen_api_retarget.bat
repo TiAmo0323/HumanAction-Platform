@@ -1,7 +1,8 @@
 @echo off
 setlocal
 
-REM Start InterGen async API with fast text-to-retarget testing enabled.
+REM Canonical InterGen API entry point. Retarget resources are configured here,
+REM while each request's skin_ids decides which final videos are generated.
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_ROOT=%SCRIPT_DIR%.."
 for %%I in ("%PROJECT_ROOT%") do set "PROJECT_ROOT=%%~fI"
@@ -43,7 +44,7 @@ if "%INTERGEN_FIXED_SAMPLING_STRATEGY%"=="" set "INTERGEN_FIXED_SAMPLING_STRATEG
 set "PYTHONIOENCODING=utf-8"
 set "INTERGEN_SUBPROCESS_ENCODING=utf-8"
 set "INTERGEN_SUBPROCESS_ERRORS=replace"
-set "INTERGEN_RETARGET_ENABLED=1"
+set "INTERGEN_RETARGET_ENABLED=0"
 set "INTERGEN_BLENDER_EXE=D:\Blender_4.2\blender.exe"
 set "INTERGEN_TARGET_FBX=D:\HumanAction_Platform\X Bot.fbx"
 set "INTERGEN_RETARGET_MAPPING=D:\HumanAction_Platform\momask-main\assets\mapping.json"

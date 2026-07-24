@@ -1003,7 +1003,553 @@ def apply_foot_contact_locking(
     }
 
 
-def render_output(output_path: Path, fps: int, frame_end: int) -> None:
+def _find_target_body_mesh(target):
+    meshes = [
+        obj
+        for obj in _target_related_objects(target)
+        if obj.type == "MESH" and not obj.hide_render and len(obj.data.vertices) > 0
+    ]
+    if not meshes:
+        return None
+    return max(meshes, key=lambda obj: len(obj.data.vertices))
+
+
+def _torso_proxy_vertex_indices(mesh, group_names: tuple, minimum_weight: float) -> tuple[list, list]:
+    group_indices = {
+        group.index
+        for group in mesh.vertex_groups
+        if any(group.name.lower().endswith(name.lower()) for name in group_names)
+    }
+    matched_names = [
+        group.name for group in mesh.vertex_groups if group.index in group_indices
+    ]
+    vertex_indices = []
+    for vertex in mesh.data.vertices:
+        torso_weight = sum(
+            assignment.weight
+            for assignment in vertex.groups
+            if assignment.group in group_indices
+        )
+        if torso_weight >= minimum_weight:
+            vertex_indices.append(vertex.index)
+    return vertex_indices, matched_names
+
+
+def _ellipse_slice_bounds(points: list, longitudinal: float, half_height: float):
+    selected = [point for point in points if abs(point.y - longitudinal) <= half_height]
+    if len(selected) < 8:
+        selected = sorted(points, key=lambda point: abs(point.y - longitudinal))[:32]
+    if len(selected) < 4:
+        return None
+    xs = [point.x for point in selected]
+    zs = [point.z for point in selected]
+    center_x = (min(xs) + max(xs)) * 0.5
+    center_z = (min(zs) + max(zs)) * 0.5
+    radius_x = (max(xs) - min(xs)) * 0.5
+    radius_z = (max(zs) - min(zs)) * 0.5
+    if radius_x <= 1e-5 or radius_z <= 1e-5:
+        return None
+    return center_x, center_z, radius_x, radius_z, len(selected)
+
+
+def _hand_proxy_correction(
+    target,
+    hips,
+    hand,
+    torso_world_points: list,
+    side: str,
+    slice_half_height: float,
+    proxy_scale: float,
+    clearance: float,
+    penetration_threshold: float,
+    max_correction: float,
+) -> tuple[Vector, float, dict]:
+    hips_world = target.matrix_world @ hips.matrix
+    world_to_proxy = hips_world.inverted()
+    torso_points = [world_to_proxy @ point for point in torso_world_points]
+    head_world = target.matrix_world @ hand.head
+    tail_world = target.matrix_world @ hand.tail
+    sample_world = [
+        head_world,
+        head_world.lerp(tail_world, 0.5),
+        tail_world,
+    ]
+    samples = [world_to_proxy @ point for point in sample_world]
+
+    head_bounds = _ellipse_slice_bounds(
+        torso_points,
+        samples[0].y,
+        slice_half_height,
+    )
+    if head_bounds is None:
+        return Vector((0.0, 0.0, 0.0)), 0.0, {"sample_count": 0}
+
+    center_x, center_z, radius_x, radius_z, _ = head_bounds
+    radius_x *= proxy_scale
+    radius_z *= proxy_scale
+    relative_x = samples[0].x - center_x
+    relative_z = samples[0].z - center_z
+    normal = Vector((
+        relative_x / max(radius_x * radius_x, 1e-8),
+        relative_z / max(radius_z * radius_z, 1e-8),
+    ))
+    if normal.length <= 1e-6:
+        normal = Vector((-1.0 if side == "Left" else 1.0, 0.0))
+    else:
+        normal.normalize()
+
+    required_distance = 0.0
+    maximum_penetration = 0.0
+    inside_samples = 0
+    sample_reports = []
+    for sample_name, sample in zip(("head", "mid", "tail"), samples):
+        bounds = _ellipse_slice_bounds(torso_points, sample.y, slice_half_height)
+        if bounds is None:
+            continue
+        sample_center_x, sample_center_z, sample_radius_x, sample_radius_z, slice_count = bounds
+        sample_radius_x *= proxy_scale
+        sample_radius_z *= proxy_scale
+        px = sample.x - sample_center_x
+        pz = sample.z - sample_center_z
+        normalized_radius = (
+            (px / sample_radius_x) ** 2
+            + (pz / sample_radius_z) ** 2
+        )
+        penetration = 0.0
+        if normalized_radius < 1.0:
+            coefficient_a = (
+                (normal.x / sample_radius_x) ** 2
+                + (normal.y / sample_radius_z) ** 2
+            )
+            coefficient_b = 2.0 * (
+                px * normal.x / (sample_radius_x * sample_radius_x)
+                + pz * normal.y / (sample_radius_z * sample_radius_z)
+            )
+            coefficient_c = normalized_radius - 1.0
+            discriminant = max(
+                0.0,
+                coefficient_b * coefficient_b - 4.0 * coefficient_a * coefficient_c,
+            )
+            if coefficient_a > 1e-8:
+                penetration = max(
+                    0.0,
+                    (-coefficient_b + math.sqrt(discriminant)) / (2.0 * coefficient_a),
+                )
+        if penetration > penetration_threshold:
+            inside_samples += 1
+            maximum_penetration = max(maximum_penetration, penetration)
+            required_distance = max(required_distance, penetration + clearance)
+        sample_reports.append({
+            "sample": sample_name,
+            "normalized_radius": round(normalized_radius, 6),
+            "penetration": round(penetration, 6),
+            "slice_vertex_count": slice_count,
+        })
+
+    local_correction = Vector((normal.x * required_distance, 0.0, normal.y * required_distance))
+    world_origin = hips_world @ Vector((0.0, 0.0, 0.0))
+    world_correction = (hips_world @ local_correction) - world_origin
+    world_correction = _clamp_vector_length(world_correction, max_correction)
+    return world_correction, maximum_penetration, {
+        "inside_sample_count": inside_samples,
+        "sample_count": len(sample_reports),
+        "direction_proxy": [round(normal.x, 6), round(normal.y, 6)],
+        "samples": sample_reports,
+    }
+
+
+def _smooth_vector_track(vectors: list, window: int, max_correction: float) -> list:
+    if window <= 1 or len(vectors) < 3:
+        return [vector.copy() for vector in vectors]
+    radius = max(1, int(window) // 2)
+    smoothed = []
+    for index, original in enumerate(vectors):
+        total = Vector((0.0, 0.0, 0.0))
+        total_weight = 0.0
+        for candidate_index in range(max(0, index - radius), min(len(vectors), index + radius + 1)):
+            distance = abs(candidate_index - index)
+            weight = float(radius + 1 - distance)
+            total += vectors[candidate_index] * weight
+            total_weight += weight
+        candidate = total / max(total_weight, 1e-8)
+        if original.length > 1e-6:
+            candidate = original.lerp(candidate, 0.35)
+            if candidate.length < original.length and candidate.length > 1e-6:
+                candidate = candidate.normalized() * original.length
+        smoothed.append(_clamp_vector_length(candidate, max_correction))
+    return smoothed
+
+
+def _collision_influences(active: list, blend_frames: int) -> list:
+    blend_frames = max(1, int(blend_frames))
+    influences = [1.0 if value else 0.0 for value in active]
+    for index, value in enumerate(active):
+        if not value:
+            continue
+        for distance in range(1, blend_frames + 1):
+            influence = float(blend_frames + 1 - distance) / float(blend_frames + 1)
+            if index - distance >= 0:
+                influences[index - distance] = max(influences[index - distance], influence)
+            if index + distance < len(influences):
+                influences[index + distance] = max(influences[index + distance], influence)
+    return influences
+
+
+def _true_segments(mask: list, frame_start: int) -> list:
+    segments = []
+    start = None
+    for index, value in enumerate(mask + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            segments.append({
+                "start_frame": frame_start + start,
+                "end_frame": frame_start + index - 1,
+                "frames": index - start,
+            })
+            start = None
+    return segments
+
+
+def _scan_hand_torso_proxy(
+    target,
+    body_mesh,
+    torso_vertex_indices: list,
+    frame_start: int,
+    frame_end: int,
+    slice_half_height: float,
+    proxy_scale: float,
+    clearance: float,
+    penetration_threshold: float,
+    max_correction: float,
+) -> dict:
+    hips = _find_pose_bone(target, ("Hips",))
+    hands = {
+        side: _find_pose_bone(target, (f"{side}Hand",))
+        for side in ("Left", "Right")
+    }
+    if hips is None or any(hand is None for hand in hands.values()):
+        return {
+            "status": "skipped",
+            "reason": "hips or hand bone not found",
+        }
+
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    result = {
+        side: {
+            "positions": [],
+            "corrections": [],
+            "penetrations": [],
+            "active": [],
+            "sample_details": {},
+        }
+        for side in hands
+    }
+    for frame in range(frame_start, frame_end + 1):
+        scene.frame_set(frame)
+        depsgraph.update()
+        evaluated_object = body_mesh.evaluated_get(depsgraph)
+        evaluated_mesh = evaluated_object.to_mesh()
+        mesh_world = evaluated_object.matrix_world
+        torso_world_points = [
+            mesh_world @ evaluated_mesh.vertices[index].co
+            for index in torso_vertex_indices
+        ]
+        for side, hand in hands.items():
+            position = (target.matrix_world @ hand.head).copy()
+            correction, penetration, sample_detail = _hand_proxy_correction(
+                target,
+                hips,
+                hand,
+                torso_world_points,
+                side=side,
+                slice_half_height=slice_half_height,
+                proxy_scale=proxy_scale,
+                clearance=clearance,
+                penetration_threshold=penetration_threshold,
+                max_correction=max_correction,
+            )
+            result[side]["positions"].append(position)
+            result[side]["corrections"].append(correction)
+            result[side]["penetrations"].append(penetration)
+            result[side]["active"].append(correction.length > 1e-6)
+            if correction.length > 1e-6 and len(result[side]["sample_details"]) < 12:
+                result[side]["sample_details"][str(frame)] = sample_detail
+        evaluated_object.to_mesh_clear()
+    scene.frame_set(frame_start)
+    result["status"] = "completed"
+    return result
+
+
+def _create_hand_torso_ik(
+    target,
+    side: str,
+    frame_start: int,
+    frame_end: int,
+    scan: dict,
+    blend_frames: int,
+    smoothing_window: int,
+    max_correction: float,
+) -> dict:
+    hand = _find_pose_bone(target, (f"{side}Hand",))
+    forearm = _find_pose_bone(target, (f"{side}ForeArm",))
+    if hand is None or forearm is None or forearm.parent is None:
+        return {
+            "side": side,
+            "status": "skipped",
+            "reason": "hand, forearm, or upper-arm bone not found",
+        }
+
+    original_positions = scan["positions"]
+    raw_corrections = scan["corrections"]
+    smoothed_corrections = _smooth_vector_track(
+        raw_corrections,
+        window=smoothing_window,
+        max_correction=max_correction,
+    )
+    influences = _collision_influences(scan["active"], blend_frames)
+    desired_positions = [
+        position + correction
+        for position, correction in zip(original_positions, smoothed_corrections)
+    ]
+    if not any(value > 0.0 for value in influences):
+        return {
+            "side": side,
+            "status": "skipped",
+            "reason": "no hand-torso proxy penetration detected",
+        }
+
+    bpy.ops.object.empty_add(type="PLAIN_AXES", location=desired_positions[0])
+    ik_target = bpy.context.object
+    ik_target.name = f"{target.name}_{side}_HandTorsoAvoidance"
+    ik_target.empty_display_size = 0.06
+    ik_target.hide_render = True
+
+    constraint = forearm.constraints.new(type="IK")
+    constraint.name = f"Retarget_{side}_HandTorsoAvoidance"
+    constraint.target = ik_target
+    constraint.chain_count = 2
+    if hasattr(constraint, "use_tail"):
+        constraint.use_tail = True
+    forearm.ik_stretch = 0.0
+    forearm.parent.ik_stretch = 0.0
+
+    scene = bpy.context.scene
+    for offset, frame in enumerate(range(frame_start, frame_end + 1)):
+        scene.frame_set(frame)
+        ik_target.location = desired_positions[offset]
+        ik_target.keyframe_insert(data_path="location", frame=frame)
+        constraint.influence = influences[offset]
+        constraint.keyframe_insert(data_path="influence", frame=frame)
+
+    _set_action_interpolation_linear(
+        getattr(getattr(ik_target, "animation_data", None), "action", None)
+    )
+    target_action = getattr(getattr(target, "animation_data", None), "action", None)
+    constraint_path = f'pose.bones["{forearm.name}"].constraints["{constraint.name}"]'
+    _set_action_interpolation_linear(target_action, constraint_path)
+
+    evaluated_positions = []
+    ik_errors = []
+    for offset, frame in enumerate(range(frame_start, frame_end + 1)):
+        scene.frame_set(frame)
+        evaluated = (target.matrix_world @ hand.head).copy()
+        evaluated_positions.append(evaluated)
+        if influences[offset] >= 0.999:
+            ik_errors.append((evaluated - desired_positions[offset]).length)
+
+    displacement = [
+        (evaluated - original).length
+        for evaluated, original in zip(evaluated_positions, original_positions)
+    ]
+    scene.frame_set(frame_start)
+    return {
+        "side": side,
+        "status": "applied",
+        "hand_bone": hand.name,
+        "forearm_bone": forearm.name,
+        "upper_arm_bone": forearm.parent.name,
+        "constraint": constraint.name,
+        "target": ik_target.name,
+        "candidate_frame_count": sum(1 for value in scan["active"] if value),
+        "corrected_frame_count": sum(1 for value in influences if value > 0.0),
+        "full_influence_frame_count": sum(1 for value in influences if value >= 0.999),
+        "collision_segments": _true_segments(scan["active"], frame_start),
+        "penetration_before": _numeric_stats(scan["penetrations"]),
+        "requested_correction": _numeric_stats(
+            [correction.length for correction in raw_corrections]
+        ),
+        "smoothed_correction": _numeric_stats(
+            [correction.length for correction in smoothed_corrections]
+        ),
+        "wrist_displacement": _numeric_stats(displacement),
+        "full_influence_ik_error": _numeric_stats(ik_errors),
+        "sample_details": scan["sample_details"],
+    }
+
+
+def apply_hand_torso_collision_avoidance(
+    targets,
+    frame_start: int,
+    frame_end: int,
+    enabled: bool,
+    torso_minimum_weight: float,
+    slice_half_height: float,
+    proxy_scale: float,
+    clearance: float,
+    penetration_threshold: float,
+    blend_frames: int,
+    smoothing_window: int,
+    max_correction: float,
+    report: dict,
+) -> None:
+    if not enabled:
+        report["hand_torso_collision_avoidance"] = {"enabled": False}
+        return
+
+    details = []
+    for target in targets:
+        body_mesh = _find_target_body_mesh(target)
+        if body_mesh is None:
+            details.append({
+                "target_armature": target.name,
+                "status": "skipped",
+                "reason": "target body mesh not found",
+            })
+            continue
+        torso_vertex_indices, matched_groups = _torso_proxy_vertex_indices(
+            body_mesh,
+            group_names=("Hips", "Spine", "Spine1", "Spine2"),
+            minimum_weight=torso_minimum_weight,
+        )
+        if len(torso_vertex_indices) < 32:
+            details.append({
+                "target_armature": target.name,
+                "body_mesh": body_mesh.name,
+                "status": "skipped",
+                "reason": "not enough torso proxy vertices",
+                "torso_vertex_count": len(torso_vertex_indices),
+                "matched_vertex_groups": matched_groups,
+            })
+            continue
+
+        before_scan = _scan_hand_torso_proxy(
+            target,
+            body_mesh,
+            torso_vertex_indices,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            slice_half_height=slice_half_height,
+            proxy_scale=proxy_scale,
+            clearance=clearance,
+            penetration_threshold=penetration_threshold,
+            max_correction=max_correction,
+        )
+        if before_scan.get("status") != "completed":
+            details.append({
+                "target_armature": target.name,
+                "body_mesh": body_mesh.name,
+                **before_scan,
+            })
+            continue
+
+        side_details = []
+        for side in ("Left", "Right"):
+            side_details.append(_create_hand_torso_ik(
+                target,
+                side=side,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                scan=before_scan[side],
+                blend_frames=blend_frames,
+                smoothing_window=smoothing_window,
+                max_correction=max_correction,
+            ))
+
+        after_scan = _scan_hand_torso_proxy(
+            target,
+            body_mesh,
+            torso_vertex_indices,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            slice_half_height=slice_half_height,
+            proxy_scale=proxy_scale,
+            clearance=clearance,
+            penetration_threshold=penetration_threshold,
+            max_correction=max_correction,
+        )
+        for side_detail in side_details:
+            side = side_detail["side"]
+            if after_scan.get("status") == "completed":
+                side_detail["candidate_frame_count_after"] = sum(
+                    1 for value in after_scan[side]["active"] if value
+                )
+                side_detail["penetration_after"] = _numeric_stats(
+                    after_scan[side]["penetrations"]
+                )
+
+        details.append({
+            "target_armature": target.name,
+            "body_mesh": body_mesh.name,
+            "body_mesh_vertex_count": len(body_mesh.data.vertices),
+            "torso_proxy_vertex_count": len(torso_vertex_indices),
+            "matched_vertex_groups": matched_groups,
+            "sides": side_details,
+        })
+
+    bpy.context.scene.frame_set(frame_start)
+    report["hand_torso_collision_avoidance"] = {
+        "enabled": True,
+        "method": "target-mesh torso ellipse proxy with animated two-bone arm IK",
+        "torso_minimum_weight": torso_minimum_weight,
+        "slice_half_height": slice_half_height,
+        "proxy_scale": proxy_scale,
+        "clearance": clearance,
+        "penetration_threshold": penetration_threshold,
+        "blend_frames": blend_frames,
+        "smoothing_window": smoothing_window,
+        "max_correction": max_correction,
+        "details": details,
+    }
+
+
+def configure_render_settings(manifest: dict, report: dict) -> None:
+    scene = bpy.context.scene
+    requested_engine = str(manifest.get("render_engine") or "").strip()
+    if requested_engine:
+        scene.render.engine = requested_engine
+
+    requested_samples = manifest.get("eevee_render_samples")
+    if requested_samples is not None:
+        samples = max(1, int(requested_samples))
+        eevee = getattr(scene, "eevee", None)
+        if eevee is None or not hasattr(eevee, "taa_render_samples"):
+            raise RuntimeError(
+                "This Blender version does not expose Eevee taa_render_samples."
+            )
+        eevee.taa_render_samples = samples
+
+    requested_percentage = manifest.get("resolution_percentage")
+    if requested_percentage is not None:
+        scene.render.resolution_percentage = max(
+            1,
+            min(100, int(requested_percentage)),
+        )
+
+    eevee = getattr(scene, "eevee", None)
+    report["render_settings"] = {
+        "engine": scene.render.engine,
+        "eevee_render_samples": (
+            int(eevee.taa_render_samples)
+            if eevee is not None and hasattr(eevee, "taa_render_samples")
+            else None
+        ),
+        "resolution_percentage": int(scene.render.resolution_percentage),
+    }
+
+
+def render_output(output_path: Path, fps: int, frame_end: int, report: dict) -> None:
     scene = bpy.context.scene
     scene.frame_start = 1
     scene.frame_end = max(1, int(frame_end))
@@ -1015,6 +1561,18 @@ def render_output(output_path: Path, fps: int, frame_end: int) -> None:
     width, height = _parse_render_size(str(scene.get("retarget_render_size", "")))
     scene.render.resolution_x = width
     scene.render.resolution_y = height
+    report["render_settings"].update(
+        {
+            "resolution_x": int(scene.render.resolution_x),
+            "resolution_y": int(scene.render.resolution_y),
+            "fps": int(scene.render.fps),
+            "frame_start": int(scene.frame_start),
+            "frame_end": int(scene.frame_end),
+            "output_format": scene.render.image_settings.file_format,
+            "ffmpeg_format": scene.render.ffmpeg.format,
+            "ffmpeg_codec": scene.render.ffmpeg.codec,
+        }
+    )
     bpy.ops.render.render(animation=True)
 
 
@@ -1049,6 +1607,7 @@ def main() -> int:
         report["motion_prompt"] = str(manifest.get("motion_prompt") or "")
 
         clear_scene()
+        configure_render_settings(manifest, report)
         enable_addons(report)
         mapping_data = clean_mapping(mapping_file, report)
 
@@ -1174,8 +1733,39 @@ def main() -> int:
             max_correction=float(manifest.get("foot_lock_max_correction") or 0.15),
             report=report,
         )
+        apply_hand_torso_collision_avoidance(
+            target_armatures,
+            frame_start=1,
+            frame_end=frame_end,
+            enabled=_as_bool(manifest.get("hand_torso_collision_enabled"), True),
+            torso_minimum_weight=float(
+                manifest.get("hand_torso_collision_torso_minimum_weight") or 0.5
+            ),
+            slice_half_height=float(
+                manifest.get("hand_torso_collision_slice_half_height") or 0.05
+            ),
+            proxy_scale=float(
+                manifest.get("hand_torso_collision_proxy_scale") or 0.95
+            ),
+            clearance=float(
+                manifest.get("hand_torso_collision_clearance") or 0.025
+            ),
+            penetration_threshold=float(
+                manifest.get("hand_torso_collision_penetration_threshold") or 0.005
+            ),
+            blend_frames=int(
+                manifest.get("hand_torso_collision_blend_frames") or 4
+            ),
+            smoothing_window=int(
+                manifest.get("hand_torso_collision_smoothing_window") or 5
+            ),
+            max_correction=float(
+                manifest.get("hand_torso_collision_max_correction") or 0.12
+            ),
+            report=report,
+        )
         setup_camera_and_lights(target_armatures, report)
-        render_output(output_mp4, fps=fps, frame_end=frame_end)
+        render_output(output_mp4, fps=fps, frame_end=frame_end, report=report)
 
         debug_blend.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.wm.save_as_mainfile(filepath=str(debug_blend))
