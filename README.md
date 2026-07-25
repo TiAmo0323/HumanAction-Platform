@@ -26,6 +26,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - InterGen 默认输出 6～7 秒动作，并记录帧数、FPS 和实际时长。
 - 重定向人物间距会根据舞蹈、拳击、击剑等动作类型自动调整。
 - 已有 NPY 的 InterGen 任务可以只重试 BVH 和 Blender，无需重新运行动作生成。
+- 前端蒙皮选择默认采用单选模式，点击机器人会直接替换 SMPL；主动切换为多选模式后才会同时生成多种蒙皮。
 - LODGE 音频链路支持音频转 WAV、35 维音乐特征提取、Global/Local 两阶段推理、动作拼接、BVH 导出和单角色重定向。
 - LODGE 音频输入任务会把上传的原始音乐以 AAC 音轨加入所选 SMPL/机器人 MP4，视频轨不重新编码。
 - LODGE 推荐启动配置已将普通 SMPL/SMPL-X 预览与重定向视频统一为最多 2000 帧，在 30 FPS 下最长约 66.67 秒。
@@ -109,7 +110,8 @@ HumanAction-Platform-main/
 │  ├─ __init__.py                       # 将 shared 标记为可导入的 Python 包
 │  └─ skin_catalog.py                   # 蒙皮配置加载、校验与资源路径解析
 ├─ tests/
-│  ├─ test_skin_output_selection.py     # 单选/多选蒙皮的快速回归测试
+│  ├─ test_skin_output_selection.py     # 后端单选/多选蒙皮快速回归测试
+│  ├─ test_frontend_skin_selection_mode.mjs # 前端单选/多选交互回归测试
 │  └─ test_lodge_audio_mux.py           # LODGE 原始音乐封装与失败保护测试
 ├─ InterGen_api/
 │  ├─ intergen_async_api.py             # 文本生成异步 API
@@ -131,6 +133,7 @@ HumanAction-Platform-main/
    ├─ src/App.vue
    ├─ src/components/SkinSelector.vue
    ├─ src/config/skinOptions.js
+   ├─ src/config/skinSelection.js
    ├─ BACKEND_CALL_GUIDE.md
    └─ package.json
 ```
@@ -182,6 +185,32 @@ skin_ids
 ```
 
 因此，显式传入 `skin_ids=["smpl"]` 时，即使旧参数 `retarget_enabled=true` 也只生成 SMPL；旧客户端只传 `retarget_enabled=true` 时则兼容为同时请求 `smpl` 和 `robot`。
+
+### 前端单选/多选模式
+
+`project/src/components/SkinSelector.vue` 提供一个显式模式切换按钮，默认显示
+“单选模式”：
+
+- 单选模式下始终只保留一项；默认 SMPL 时点击机器人会直接变为
+  `skin_ids=["robot"]`，不会误触为双选；
+- 点击模式按钮切换为多选后，才允许追加或取消蒙皮，但始终至少保留一项；
+- 多选切回单选时保留最近加入的蒙皮；
+- 任务生成期间蒙皮选项与模式切换按钮都会禁用，当前任务继续使用提交时锁定的
+  `skin_ids`；
+- 该切换只改变前端如何组织 `skin_ids`，不改变 InterGen/LODGE 的后端接口。
+
+选择规则集中在 `project/src/config/skinSelection.js`，没有把 `smpl` 和 `robot`
+写死在组件逻辑中，因此后续目录新增蒙皮仍可复用相同单选/多选行为。
+
+### `tests/test_frontend_skin_selection_mode.mjs`
+
+该 Node 测试覆盖默认 SMPL 切换机器人、主动多选、至少保留一项、多选切回单选
+以及未来蒙皮 ID。运行：
+
+```bat
+cd project
+npm.cmd run test:skin-selection
+```
 
 ### `tests/test_skin_output_selection.py`
 

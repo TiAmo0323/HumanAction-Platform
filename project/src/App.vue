@@ -94,7 +94,9 @@
           :model-value="selectedSkinIds"
           :options="skinOptions"
           :disabled="isGenerating"
+          :selection-mode="skinSelectionMode"
           @update:model-value="selectSkins"
+          @update:selection-mode="skinSelectionMode = $event"
         />
 
         <section class="generation-stage" :class="{ generating: isGenerating }">
@@ -223,6 +225,7 @@ import {
   getSkinOption,
   skinOptions as defaultSkinOptions
 } from './config/skinOptions'
+import { SINGLE_SKIN_SELECTION } from './config/skinSelection'
 
 const runtimeHost = (import.meta.env.VITE_API_HOST || (typeof window !== 'undefined' ? window.location.hostname : '47.116.49.93') || '47.116.49.93').trim()
 const runtimeProtocol = (import.meta.env.VITE_API_PROTOCOL || (typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http') || 'http').trim().toLowerCase()
@@ -254,6 +257,7 @@ const isUploadReady = ref(false)
 const taskStatusText = ref('')
 const skinOptions = ref([...defaultSkinOptions])
 const selectedSkinIds = ref([DEFAULT_SKIN_ID])
+const skinSelectionMode = ref(SINGLE_SKIN_SELECTION)
 const activeTaskSkinIds = ref([])
 const generatedSkinId = ref('')
 const generatedOutputs = ref({})

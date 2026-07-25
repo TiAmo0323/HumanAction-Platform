@@ -3,18 +3,40 @@
     <div class="skin-selector-copy">
       <span class="skin-selector-kicker">角色外观</span>
       <div>
-        <h3 id="skin-selector-title">选择蒙皮</h3>
-        <p>可选择一个或多个蒙皮；后端只生成勾选的视频。</p>
+        <div class="skin-selector-heading">
+          <h3 id="skin-selector-title">选择蒙皮</h3>
+          <button
+            type="button"
+            class="selection-mode-toggle"
+            :class="{ multi: isMultiSelect }"
+            :aria-pressed="isMultiSelect"
+            :aria-label="isMultiSelect ? '当前为多选模式，点击切换为单选模式' : '当前为单选模式，点击切换为多选模式'"
+            :title="isMultiSelect ? '切换为单选模式' : '切换为多选模式'"
+            :disabled="disabled"
+            @click="toggleSelectionMode"
+          >
+            <span class="selection-mode-icon" aria-hidden="true">
+              <i></i>
+              <i></i>
+            </span>
+            {{ isMultiSelect ? '多选模式' : '单选模式' }}
+          </button>
+        </div>
+        <p>{{ selectionHint }}</p>
       </div>
     </div>
 
-    <div class="skin-options" role="group" aria-label="蒙皮多选项">
+    <div
+      class="skin-options"
+      role="group"
+      :aria-label="isMultiSelect ? '蒙皮多选项' : '蒙皮单选项'"
+    >
       <button
         v-for="option in options"
         :key="option.id"
         type="button"
         class="skin-option"
-        :class="{ active: modelValue.includes(option.id) }"
+        :class="{ active: modelValue.includes(option.id), single: !isMultiSelect }"
         :aria-pressed="modelValue.includes(option.id)"
         :disabled="disabled"
         @click="toggleOption(option.id)"
@@ -43,6 +65,14 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
+import {
+  MULTI_SKIN_SELECTION,
+  SINGLE_SKIN_SELECTION,
+  normalizeSkinSelection,
+  toggleSkinSelection
+} from '../config/skinSelection'
+
 const props = defineProps({
   modelValue: {
     type: Array,
@@ -55,17 +85,40 @@ const props = defineProps({
   disabled: {
     type: Boolean,
     default: false
+  },
+  selectionMode: {
+    type: String,
+    default: SINGLE_SKIN_SELECTION,
+    validator: (value) => [SINGLE_SKIN_SELECTION, MULTI_SKIN_SELECTION].includes(value)
   }
 })
 
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits(['update:modelValue', 'update:selectionMode'])
+
+const isMultiSelect = computed(() => props.selectionMode === MULTI_SKIN_SELECTION)
+const selectionHint = computed(() => (
+  isMultiSelect.value
+    ? '多选开启：可同时生成多个蒙皮视频。'
+    : '单选开启：点击新蒙皮会替换当前选项。'
+))
 
 const toggleOption = (skinId) => {
-  const next = props.modelValue.includes(skinId)
-    ? props.modelValue.filter((value) => value !== skinId)
-    : [...props.modelValue, skinId]
-  if (!next.length) return
+  const next = toggleSkinSelection(props.modelValue, skinId, props.selectionMode)
   emit('update:modelValue', next)
+}
+
+const toggleSelectionMode = () => {
+  const nextMode = isMultiSelect.value
+    ? SINGLE_SKIN_SELECTION
+    : MULTI_SKIN_SELECTION
+  const nextSelection = normalizeSkinSelection(props.modelValue, nextMode)
+  emit('update:selectionMode', nextMode)
+  if (
+    nextSelection.length !== props.modelValue.length
+    || nextSelection.some((skinId, index) => skinId !== props.modelValue[index])
+  ) {
+    emit('update:modelValue', nextSelection)
+  }
 }
 </script>
 
@@ -108,6 +161,75 @@ const toggleOption = (skinId) => {
   margin: 0;
   color: #213a2c;
   font-size: 0.94rem;
+}
+
+.skin-selector-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.selection-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 25px;
+  padding: 4px 8px;
+  border: 1px solid rgba(31, 143, 98, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #416052;
+  font-family: inherit;
+  font-size: 0.65rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
+}
+
+.selection-mode-toggle:hover:not(:disabled),
+.selection-mode-toggle.multi {
+  border-color: rgba(31, 143, 98, 0.58);
+  background: rgba(31, 143, 98, 0.1);
+  color: #18774f;
+}
+
+.selection-mode-toggle:focus-visible {
+  outline: 3px solid rgba(31, 143, 98, 0.2);
+  outline-offset: 2px;
+}
+
+.selection-mode-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.selection-mode-icon {
+  position: relative;
+  width: 15px;
+  height: 10px;
+}
+
+.selection-mode-icon i {
+  position: absolute;
+  top: 2px;
+  width: 7px;
+  height: 7px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.selection-mode-icon i:first-child {
+  left: 0;
+}
+
+.selection-mode-icon i:last-child {
+  right: 0;
+  opacity: 0.35;
+}
+
+.selection-mode-toggle.multi .selection-mode-icon i:last-child {
+  opacity: 1;
 }
 
 .skin-selector-copy p {
@@ -179,6 +301,11 @@ const toggleOption = (skinId) => {
 
 .skin-option.active .skin-option-indicator {
   border-color: #1f8f62;
+}
+
+.skin-option.single .skin-option-indicator,
+.skin-option.single .skin-option-indicator span {
+  border-radius: 50%;
 }
 
 .skin-option-indicator span {
