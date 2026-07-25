@@ -27,6 +27,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - 重定向人物间距会根据舞蹈、拳击、击剑等动作类型自动调整。
 - 已有 NPY 的 InterGen 任务可以只重试 BVH 和 Blender，无需重新运行动作生成。
 - LODGE 音频链路支持音频转 WAV、35 维音乐特征提取、Global/Local 两阶段推理、动作拼接、BVH 导出和单角色重定向。
+- LODGE 音频输入任务会把上传的原始音乐以 AAC 音轨加入所选 SMPL/机器人 MP4，视频轨不重新编码。
 - LODGE 推荐启动配置已将普通 SMPL/SMPL-X 预览与重定向视频统一为最多 2000 帧，在 30 FPS 下最长约 66.67 秒。
 - LODGE 机器人渲染已显式固定为 Blender Eevee Next、32 samples、100% 分辨率；同一份2000帧动作的严格对照中，Blender 耗时相对64 samples下降约26.43%。
 
@@ -37,7 +38,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - 两个重定向角色默认都使用同一个 `X Bot.fbx`，尚未区分性别或角色外观。
 - 任务状态主要保存在内存中，API 重启后原任务查询可能返回 404，但任务文件仍保留在磁盘。
 - 前端与两套后端已统一使用 `skin_ids` 多选契约，并通过 `available_skin_ids` 区分任务实际可用结果。
-- LODGE 普通 SMPL/SMPL-X 预览目前没有混入上传的原始音乐，输出通常是静音视频。
+- LODGE 特征 NPY 和动作 NPY 输入不包含原始音乐，因此这两类任务仍输出静音视频。
 - LODGE 音乐特征写入共享的 `LODGE-main/data/finedance/music_npy` 目录；默认单任务串行执行，提高并发前需要先隔离 `song_id` 和推理输出目录。
 - CPU API 用于无 CUDA 环境的兼容运行，速度较慢，且 LODGE CPU 版不包含当前 GPU 版的 BVH/Blender 重定向完整输出契约。
 - 前端语音模式仍未开放。
@@ -62,6 +63,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
   -> BVH
   -> Blender + Rokoko 单角色重定向 MP4
   -> SMPL/SMPL-X 预览 MP4
+  -> FFmpeg 将原始音乐封装进所选最终 MP4
 ```
 
 服务端口：
@@ -107,7 +109,8 @@ HumanAction-Platform-main/
 │  ├─ __init__.py                       # 将 shared 标记为可导入的 Python 包
 │  └─ skin_catalog.py                   # 蒙皮配置加载、校验与资源路径解析
 ├─ tests/
-│  └─ test_skin_output_selection.py     # 单选/多选蒙皮的快速回归测试
+│  ├─ test_skin_output_selection.py     # 单选/多选蒙皮的快速回归测试
+│  └─ test_lodge_audio_mux.py           # LODGE 原始音乐封装与失败保护测试
 ├─ InterGen_api/
 │  ├─ intergen_async_api.py             # 文本生成异步 API
 │  ├─ intergen_async_api_cpu.py         # CPU 兼容 API
@@ -197,6 +200,23 @@ skin_ids
 D:\Anaconda\envs\intergen_01\python.exe tests\test_skin_output_selection.py
 ```
 
+### `tests/test_lodge_audio_mux.py`
+
+该测试使用 FFmpeg 生成约 2 秒的临时静音视频和原始音频，验证：
+
+- 最终 MP4 同时包含视频轨和音频轨；
+- 封装前后视频码流 SHA-256 一致；
+- 原始音乐短于视频时仍完整保留全部视频码流；
+- `audio_mux_status`、`audio_muxed_skin_ids` 和实际音频提前量正确更新；
+- 请求提前量超过音频长度时自动回退为 `0 s`，不让已完成的渲染任务失败；
+- 音频源无有效音轨时保留原视频并清理失败临时文件。
+
+在能够解析 FFmpeg 的环境中运行：
+
+```bat
+D:\Anaconda\envs\lodge\python.exe tests\test_lodge_audio_mux.py
+```
+
 ## 环境准备
 
 建议继续使用当前已经验证过的两个 Conda 环境：
@@ -274,10 +294,21 @@ set "LODGE_RETARGET_RENDER_SIZE=1080x1080"
 set "LODGE_RETARGET_RENDER_ENGINE=BLENDER_EEVEE_NEXT"
 set "LODGE_RETARGET_EEVEE_SAMPLES=32"
 set "LODGE_RETARGET_RESOLUTION_PERCENTAGE=100"
+set "LODGE_AUDIO_MUX_BITRATE=192k"
+set "LODGE_AUDIO_MUX_TIMEOUT_SEC=300"
+set "LODGE_AUDIO_ADVANCE_SEC=2.0"
 set "LODGE_RETARGET_HAND_TORSO_COLLISION=1"
 ```
 
-因此新任务的普通预览和重定向视频会使用同一份、最多 2000 帧的动作；实际视频时长取决于动作真实帧数。默认还会在渲染前执行目标角色空间的手—躯干防穿模处理。
+因此新任务的普通预览和重定向视频会使用同一份、最多 2000 帧的动作；实际视频时长取决于动作真实帧数。机器人渲染阶段还会执行目标角色空间的手—躯干防穿模处理。
+音频上传任务会在渲染后把原始上传音乐加入每个所选视频；FFmpeg 按
+`LODGE_FFMPEG_EXE`、系统 `PATH`、`imageio-ffmpeg` 内置程序的顺序查找，
+视频轨直接复制，音频默认编码为 `192k AAC`。
+标准启动脚本还会把播放音频开头裁去 `2.0 s` 后重新从时间戳 0 开始封装，
+用于补偿当前 LODGE 基线在实测样例中的动作—音乐相位差；该值不会增加推理或
+渲染时间，可通过 `LODGE_AUDIO_ADVANCE_SEC=0` 关闭或按后续样例微调。若上传
+音频短到裁剪后没有有效音频包，封装会自动以 `0 s` 提前量重试并在任务字段中
+回显实际值，避免昂贵的已完成渲染因短音频而失败。
 
 ### 3. 启动前端
 
@@ -463,7 +494,14 @@ skin_ids=robot
   -> lodge2bvh.py 导出 <song_id>.bvh
   -> 可选 Blender/Rokoko 重定向
   -> render.py 生成普通 SMPL/SMPL-X 预览
+  -> FFmpeg 按视频实际时长加入 uploaded.<ext> 的原始音轨
+  -> 验证视频轨和音频轨后原子替换最终 MP4
 ```
+
+这里的 `input.wav` 用于模型特征提取；最终视频优先使用
+`uploaded.<ext>` 原始文件的音轨，避免把非 WAV 输入转换后的
+15360 Hz 单声道音频作为播放音轨。音乐长于视频时截取开头对应片段；
+音乐短于视频时保留完整动作，音乐结束后的部分保持静音。
 
 LODGE 推理通过环境变量将单个任务限定到对应音乐：
 
@@ -501,6 +539,9 @@ Global/Local 模型及权重目前在每个推理子进程中重新加载，因�
 - `output_mp4_path`
 - `output_retarget_mp4_path`
 - `retarget_status` / `retarget_message`
+- `audio_mux_status` / `audio_mux_message`
+- `audio_muxed_skin_ids`
+- `audio_mux_advance_seconds`
 - `stdout_tail` / `stderr_tail`
 
 查询任务：
@@ -543,6 +584,9 @@ LODGE_api/task_runs/<task_id>/
 ```
 
 `input.wav` 只在音频输入链路产生；关闭重定向或缺少 Blender/Rokoko 配置时不会生成 `retarget/` 下的视频。
+音频上传任务生成的 `<song_id>z.mp4` 和 `<song_id>_retarget.mp4` 会直接包含
+原始音乐；封装使用临时文件验证后原子替换，失败时保留静音渲染结果用于排查，
+但不会把该蒙皮标记为成功完成音频封装。
 
 ### LODGE 视频时长
 
@@ -741,7 +785,7 @@ InterGen 与 LODGE 始终分别通过 `start_intergen_api_retarget.bat` 和
 - 为新增角色准备独立 FBX 与骨骼映射，并在 `config/skin_catalog.json` 注册蒙皮 ID。
 - 持久化任务状态，使 API 重启后仍可查询历史任务。
 - 为 LODGE 增加历史任务重定向重试接口，并隔离并发任务的音乐特征和推理输出目录。
-- 将 LODGE 原始音乐混入普通预览和重定向视频。
+- 为历史 LODGE 静音任务增加无需重新推理或渲染的音频封装重试接口。
 - 增加文本语义评分，而不仅依赖碰撞质量选择候选。
 - 为球类、击剑等持道具动作增加训练数据和 Blender 道具绑定。
 - 增加逐帧双人体表碰撞检测和距离约束。

@@ -179,6 +179,10 @@ class TaskInfo(BaseModel):
     output_retarget_path: Optional[str] = None
     retarget_status: str = ""
     retarget_message: str = ""
+    audio_mux_status: str = "not_requested"
+    audio_mux_message: str = ""
+    audio_muxed_skin_ids: List[str] = Field(default_factory=list)
+    audio_mux_advance_seconds: float = 0.0
     stdout_tail: str = ""
     stderr_tail: str = ""
 
@@ -414,6 +418,271 @@ def _run_command_inherit_cwd(command: List[str], cwd: Path) -> subprocess.Comple
     )
 
 
+def _resolve_ffmpeg_executable() -> str:
+    configured = os.getenv("LODGE_FFMPEG_EXE", "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser().resolve()
+        if not configured_path.is_file():
+            raise FileNotFoundError(f"LODGE_FFMPEG_EXE not found: {configured_path}")
+        return str(configured_path)
+
+    discovered = shutil.which("ffmpeg")
+    if discovered:
+        return str(Path(discovered).resolve())
+
+    try:
+        import imageio_ffmpeg
+
+        bundled = Path(imageio_ffmpeg.get_ffmpeg_exe()).expanduser().resolve()
+        if bundled.is_file():
+            return str(bundled)
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        "FFmpeg not found. Set LODGE_FFMPEG_EXE, add ffmpeg to PATH, "
+        "or install imageio-ffmpeg in the LODGE environment."
+    )
+
+
+def _run_timed_command(
+    command: List[str],
+    cwd: Path,
+    timeout_sec: int,
+) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            command,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding=SUBPROCESS_ENCODING,
+            errors=SUBPROCESS_ERRORS,
+            check=False,
+            timeout=max(1, timeout_sec),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(SUBPROCESS_ENCODING, errors=SUBPROCESS_ERRORS)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(SUBPROCESS_ENCODING, errors=SUBPROCESS_ERRORS)
+        stderr += f"\nProcess timeout after {timeout_sec} seconds"
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
+
+
+def _motion_duration_seconds(npy_path: Path, fps: int) -> float:
+    if fps <= 0:
+        raise ValueError(f"Invalid video fps for audio mux: {fps}")
+    try:
+        motion = np.load(str(npy_path), mmap_mode="r", allow_pickle=False)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read motion duration from {npy_path}: {exc}") from exc
+    if getattr(motion, "ndim", 0) < 1 or int(motion.shape[0]) <= 0:
+        raise ValueError(f"Motion file has no frames: {npy_path}")
+    return float(motion.shape[0]) / float(fps)
+
+
+def _task_audio_muxed_skin_ids(task_id: str, completed_skin_id: str) -> List[str]:
+    with _task_lock:
+        task = _tasks.get(task_id)
+        existing = list(task.audio_muxed_skin_ids) if task else []
+        requested = list(task.requested_skin_ids) if task else []
+    if completed_skin_id and completed_skin_id not in existing:
+        existing.append(completed_skin_id)
+    existing_set = set(existing)
+    ordered = [skin_id for skin_id in requested if skin_id in existing_set]
+    ordered.extend(skin_id for skin_id in existing if skin_id not in ordered)
+    return ordered
+
+
+def _mux_original_audio(
+    task_id: str,
+    video_path: Path,
+    source_audio_path: Path,
+    duration_seconds: float,
+    skin_id: str,
+) -> None:
+    video_path = video_path.resolve()
+    source_audio_path = source_audio_path.resolve()
+    if not video_path.is_file():
+        raise FileNotFoundError(f"Video for audio mux not found: {video_path}")
+    if not source_audio_path.is_file():
+        raise FileNotFoundError(f"Original audio source not found: {source_audio_path}")
+    if duration_seconds <= 0:
+        raise ValueError(f"Invalid video duration for audio mux: {duration_seconds}")
+
+    ffmpeg_exe = _resolve_ffmpeg_executable()
+    temp_output = video_path.with_name(
+        f".{video_path.stem}.audio-{uuid.uuid4().hex}.tmp.mp4"
+    )
+    bitrate = os.getenv("LODGE_AUDIO_MUX_BITRATE", "192k").strip() or "192k"
+    timeout_sec = _env_int("LODGE_AUDIO_MUX_TIMEOUT_SEC", 300)
+    requested_advance_seconds = max(
+        0.0,
+        _env_float("LODGE_AUDIO_ADVANCE_SEC", 0.0),
+    )
+    label = skin_id or "video"
+    _update_task(
+        task_id,
+        audio_mux_status="running",
+        audio_mux_message=(
+            f"Attaching original audio to {label} video "
+            f"(requested advance {requested_advance_seconds:.3f}s)"
+        ),
+        audio_mux_advance_seconds=requested_advance_seconds,
+    )
+
+    try:
+        attempt_advances = [requested_advance_seconds]
+        if requested_advance_seconds > 0:
+            # Very short uploads may contain no samples after atrim. Preserve a
+            # usable result by retrying without calibration and report the
+            # actual applied value in TaskInfo.
+            attempt_advances.append(0.0)
+
+        applied_advance_seconds: Optional[float] = None
+        last_reason = "FFmpeg did not produce a valid output file"
+        for candidate_advance in attempt_advances:
+            audio_filters = []
+            if candidate_advance > 0:
+                audio_filters.extend(
+                    [
+                        f"atrim=start={candidate_advance:.6f}",
+                        "asetpts=PTS-STARTPTS",
+                    ]
+                )
+            audio_filters.append("aresample=async=1:first_pts=0")
+
+            mux_command = [
+                ffmpeg_exe,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(video_path),
+                "-i",
+                str(source_audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map_metadata",
+                "0",
+                "-sn",
+                "-dn",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                bitrate,
+                "-af",
+                ",".join(audio_filters),
+                "-t",
+                f"{duration_seconds:.6f}",
+                "-movflags",
+                "+faststart",
+                str(temp_output),
+            ]
+            mux_proc = _run_timed_command(
+                mux_command,
+                video_path.parent,
+                timeout_sec,
+            )
+            if (
+                mux_proc.returncode != 0
+                or not temp_output.is_file()
+                or temp_output.stat().st_size <= 0
+            ):
+                last_reason = (
+                    _last_nonempty_line(mux_proc.stderr)
+                    or _last_nonempty_line(mux_proc.stdout)
+                    or "FFmpeg did not produce a valid output file"
+                )
+                continue
+
+            validate_command = [
+                ffmpeg_exe,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(temp_output),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-t",
+                "0.1",
+                "-f",
+                "streamhash",
+                "-hash",
+                "sha256",
+                "-",
+            ]
+            validate_proc = _run_timed_command(
+                validate_command,
+                video_path.parent,
+                min(timeout_sec, 60),
+            )
+            stream_summary = (validate_proc.stdout or "").lower()
+            if (
+                validate_proc.returncode != 0
+                or ",v," not in stream_summary
+                or ",a," not in stream_summary
+            ):
+                last_reason = (
+                    _last_nonempty_line(validate_proc.stderr)
+                    or _last_nonempty_line(validate_proc.stdout)
+                    or "Audio/video packet validation failed"
+                )
+                continue
+
+            applied_advance_seconds = candidate_advance
+            break
+
+        if applied_advance_seconds is None:
+            raise RuntimeError(f"Audio mux failed for {label}: {last_reason}")
+
+        os.replace(temp_output, video_path)
+        muxed_skin_ids = _task_audio_muxed_skin_ids(task_id, skin_id)
+        fallback_note = (
+            "; short-audio fallback from "
+            f"{requested_advance_seconds:.3f}s"
+            if applied_advance_seconds != requested_advance_seconds
+            else ""
+        )
+        _update_task(
+            task_id,
+            audio_mux_status="succeeded",
+            audio_mux_message=(
+                f"Original audio attached to {label} video "
+                f"(advanced by {applied_advance_seconds:.3f}s"
+                f"{fallback_note})"
+            ),
+            audio_muxed_skin_ids=muxed_skin_ids,
+            audio_mux_advance_seconds=applied_advance_seconds,
+        )
+    except Exception as exc:
+        _update_task(
+            task_id,
+            audio_mux_status="failed",
+            audio_mux_message=str(exc),
+        )
+        raise
+    finally:
+        if temp_output.exists():
+            try:
+                temp_output.unlink()
+            except OSError:
+                pass
+
+
 def _cap_motion_frames_inplace(npy_path: Path, max_frames: int) -> Optional[str]:
     if max_frames <= 0:
         return None
@@ -512,6 +781,7 @@ def _run_retarget_if_requested(
     song_id: str,
     fps: int,
     retarget_options: Optional[Dict[str, object]],
+    source_audio_path: Optional[Path] = None,
 ) -> None:
     options = retarget_options or {}
     enabled = bool(options.get("enabled"))
@@ -643,6 +913,25 @@ def _run_retarget_if_requested(
         heartbeat_sec=10,
     )
     if proc.returncode == 0 and output_mp4.exists():
+        if source_audio_path is not None:
+            try:
+                _mux_original_audio(
+                    task_id=task_id,
+                    video_path=output_mp4,
+                    source_audio_path=source_audio_path,
+                    duration_seconds=_motion_duration_seconds(source_npy, fps),
+                    skin_id=str(options.get("skin_id") or "robot"),
+                )
+            except Exception as exc:
+                message = str(exc)
+                _update_task(
+                    task_id,
+                    retarget_status="failed",
+                    retarget_message=message,
+                )
+                if strict:
+                    raise RuntimeError(message) from exc
+                return
         _update_task(
             task_id,
             output_retarget_mp4_path=str(output_mp4.resolve()),
@@ -685,6 +974,7 @@ def _render_with_retry(
     mode: str,
     device: str,
     fps: int,
+    source_audio_path: Optional[Path] = None,
 ) -> None:
     render_timeout_sec = _env_int("LODGE_RENDER_TIMEOUT_SEC", 3600)
     attempts = _build_render_attempts(mode=mode, fps=fps)
@@ -723,6 +1013,28 @@ def _render_with_retry(
         if proc.returncode == 0:
             video_dir = input_dir / "video"
             output_mp4 = _find_rendered_mp4(video_dir, song_id)
+            if source_audio_path is not None:
+                try:
+                    _mux_original_audio(
+                        task_id=task_id,
+                        video_path=output_mp4,
+                        source_audio_path=source_audio_path,
+                        duration_seconds=_motion_duration_seconds(
+                            input_dir / f"{song_id}.npy",
+                            attempt_fps,
+                        ),
+                        skin_id="smpl",
+                    )
+                except Exception as exc:
+                    _update_task(
+                        task_id,
+                        status="failed",
+                        progress=100,
+                        message=str(exc),
+                        stdout_tail=_tail_text("\n\n".join(stdout_blocks)),
+                        stderr_tail=_tail_text("\n\n".join(stderr_blocks)),
+                    )
+                    return
             _update_task(
                 task_id,
                 status="succeeded",
@@ -795,7 +1107,7 @@ def _ensure_wav_source(task_root: Path, source_audio: Path, lodge_root: Path) ->
     if suffix in {".mp4", ".m4a", ".mp3", ".aac", ".flac", ".ogg"}:
         dst = input_dir / "input.wav"
         ffmpeg_cmd = [
-            "ffmpeg",
+            _resolve_ffmpeg_executable(),
             "-y",
             "-i",
             str(source_audio),
@@ -861,6 +1173,7 @@ def _render_from_sample_dir(
     device: str,
     fps: int,
     retarget_options: Optional[Dict[str, object]] = None,
+    source_audio_path: Optional[Path] = None,
 ) -> None:
     source_npy = sample_dir / "concat" / "npy" / f"{song_id}.npy"
     if not source_npy.exists():
@@ -875,7 +1188,6 @@ def _render_from_sample_dir(
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
-
     target_bvh = _export_bvh_for_npy(
         task_id=task_id,
         lodge_root=lodge_root,
@@ -892,6 +1204,7 @@ def _render_from_sample_dir(
         song_id=song_id,
         fps=fps,
         retarget_options=retarget_options,
+        source_audio_path=source_audio_path,
     )
 
     if bool((retarget_options or {}).get("render_smpl", True)):
@@ -904,6 +1217,7 @@ def _render_from_sample_dir(
             mode=mode,
             device=device,
             fps=fps,
+            source_audio_path=source_audio_path,
         )
     else:
         _finalize_retarget_only_task(task_id)
@@ -919,6 +1233,7 @@ def _render_from_npy_file(
     device: str,
     fps: int,
     retarget_options: Optional[Dict[str, object]] = None,
+    source_audio_path: Optional[Path] = None,
 ) -> None:
     if not source_npy.exists():
         raise FileNotFoundError(f"Source npy not found: {source_npy}")
@@ -932,7 +1247,6 @@ def _render_from_npy_file(
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
-
     target_bvh = _export_bvh_for_npy(
         task_id=task_id,
         lodge_root=lodge_root,
@@ -949,6 +1263,7 @@ def _render_from_npy_file(
         song_id=song_id,
         fps=fps,
         retarget_options=retarget_options,
+        source_audio_path=source_audio_path,
     )
 
     if bool((retarget_options or {}).get("render_smpl", True)):
@@ -961,6 +1276,7 @@ def _render_from_npy_file(
             mode=mode,
             device=device,
             fps=fps,
+            source_audio_path=source_audio_path,
         )
     else:
         _finalize_retarget_only_task(task_id)
@@ -1080,6 +1396,8 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
                 task_id,
                 status="failed",
                 message="Feature extraction failed",
+                audio_mux_status="failed",
+                audio_mux_message="Audio mux not started because feature extraction failed",
                 stdout_tail=_tail_text(fea_proc.stdout or ""),
                 stderr_tail=_tail_text(fea_proc.stderr or ""),
             )
@@ -1114,6 +1432,8 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
                 task_id,
                 status="failed",
                 message=msg,
+                audio_mux_status="failed",
+                audio_mux_message="Audio mux not started because LODGE inference failed",
                 stdout_tail=infer_stdout,
                 stderr_tail=infer_stderr,
             )
@@ -1131,10 +1451,20 @@ def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None
             device=req.device,
             fps=req.fps,
             retarget_options=_retarget_options_from_req(req),
+            source_audio_path=audio_path,
         )
 
     except Exception as exc:
-        _update_task(task_id, status="failed", message=str(exc))
+        with _task_lock:
+            current = _tasks.get(task_id)
+            mux_status = current.audio_mux_status if current else "pending"
+        audio_fields = {}
+        if mux_status in {"pending", "running"}:
+            audio_fields = {
+                "audio_mux_status": "failed",
+                "audio_mux_message": f"Audio mux not completed: {exc}",
+            }
+        _update_task(task_id, status="failed", message=str(exc), **audio_fields)
 
 
 def _run_infer_from_feature_npy_task(task_id: str, req: InferFromFeatureNpyRequest) -> None:
@@ -1316,6 +1646,8 @@ def create_infer_from_audio_task(req: InferFromAudioRequest) -> TaskInfo:
         skin_id=requested_skin_ids[0],
         requested_skin_ids=requested_skin_ids,
         message="Task queued",
+        audio_mux_status="pending",
+        audio_mux_message="Waiting for rendered video",
     )
     with _task_lock:
         _tasks[task_id] = task
@@ -1356,6 +1688,8 @@ async def create_infer_from_audio_upload_task(
         skin_id=requested_skin_ids[0],
         requested_skin_ids=requested_skin_ids,
         message="Task queued",
+        audio_mux_status="pending",
+        audio_mux_message="Waiting for rendered video",
     )
     with _task_lock:
         _tasks[task_id] = task

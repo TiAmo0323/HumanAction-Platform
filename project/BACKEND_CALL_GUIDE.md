@@ -127,6 +127,11 @@
   - 字段与上面类似，文件字段为 `npy_file`
 
 LODGE 任务对象包含 `progress` 字段（0-100），前端会优先使用该字段驱动进度条。
+音频上传任务还返回 `audio_mux_status`、`audio_mux_message` 和
+`audio_muxed_skin_ids`，以及实际采用的 `audio_mux_advance_seconds`。
+所选 SMPL/机器人视频会在完成前加入原始上传音乐；标准 LODGE 启动脚本将
+音频提前 `2.0 s`，用于补偿当前基线的动作—音乐相位差；
+特征 NPY 输入没有原始音乐，因此保持静音。
 
 ### 4.1 查询任务
 

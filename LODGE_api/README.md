@@ -101,6 +101,10 @@ multipart/form-data fields:
 - infer_args (optional, comma-separated string)
 
 Supported uploaded audio/video formats are converted internally to wav when needed.
+After rendering, the API attaches the original uploaded audio to every selected
+SMPL/retarget MP4. The video stream is copied without re-encoding and the audio
+stream is encoded as AAC. Feature-npy and motion-npy inputs remain silent because
+they do not contain an original audio source.
 
 ### 4.4 Feature npy upload -> infer -> render
 
@@ -117,7 +121,9 @@ Query task:
 Task response includes progress (0-100), message, requested_skin_ids, available_skin_ids,
 output_mp4_path, stdout_tail, and stderr_tail. It also includes output_npy_path,
 output_bvh_path, output_retarget_mp4_path, output_retarget_path,
-retarget_status, and retarget_message.
+retarget_status, retarget_message, audio_mux_status, audio_mux_message, and
+audio_muxed_skin_ids. Audio-upload tasks also report the effective
+audio_mux_advance_seconds value after any short-audio fallback.
 
 Download result mp4:
 
@@ -170,6 +176,17 @@ SMPL or retarget video instead of always opening the SMPL preview.
   - LODGE_RETARGET_HAND_TORSO_COLLISION: enable target-space hand-to-torso collision avoidance. Defaults to 1.
   - LODGE_RETARGET_HAND_TORSO_CLEARANCE: hand clearance outside the torso proxy in meters. Defaults to 0.025.
   - LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION: maximum wrist correction per frame in meters. Defaults to 0.12.
+- Audio mux environment variables:
+  - LODGE_FFMPEG_EXE: optional explicit FFmpeg executable. Resolution falls back to PATH and then imageio-ffmpeg.
+  - LODGE_AUDIO_MUX_BITRATE: AAC bitrate. The canonical launcher uses 192k.
+  - LODGE_AUDIO_MUX_TIMEOUT_SEC: per-video FFmpeg timeout. The canonical launcher uses 300 seconds.
+  - LODGE_AUDIO_ADVANCE_SEC: seconds trimmed from the start of the playback audio before muxing. The canonical launcher uses 2.0 to compensate for the measured LODGE motion/music phase offset; set 0 to disable.
+- Audio muxing writes a temporary MP4, validates both video and audio streams,
+  and atomically replaces the final file. The video duration is authoritative:
+  long music is trimmed, while short music never truncates the motion. The task
+  reports the applied value in `audio_mux_advance_seconds`. If an upload is too
+  short to contain audio after the requested trim, muxing retries with 0 seconds
+  rather than failing the completed render.
 - Hand-to-torso collision avoidance builds an animated proxy from the target mesh and uses temporally smoothed two-bone arm IK. Metrics are written to `hand_torso_collision_avoidance` in `rokoko_retarget_report.json`.
 - Task state is kept in memory and will be lost after API restart.
 - Outputs are stored under LODGE_api/task_runs/{task_id}/.
@@ -215,6 +232,8 @@ SMPL or retarget video instead of always opening the SMPL preview.
 - 输出目录默认在 LODGE_api/task_runs/{task_id}/。
 - 查询接口返回 progress 字段，可直接驱动前端进度条。
 - 当前统一启动脚本将机器人渲染固定为 Eevee Next、32 samples、100% 分辨率；实际值会同时写入 retarget manifest 和 Blender 报告，便于进行画质和耗时对比。
+- WAV、MP3 或带音频 MP4 上传任务会在渲染后把原始音乐加入每个所选视频。视频轨直接复制，音频编码为 AAC；特征 NPY 和动作 NPY 没有原始音乐，仍输出静音视频。
+- 音频封装先生成临时文件并验证音视频轨，再原子替换正式 MP4。音乐较长时按视频时长截取，音乐较短时不会截断动作。
 - 推荐启动脚本默认启用目标角色空间的手—躯干防穿模处理。它从 Hips/Spine 蒙皮顶点建立逐帧截面代理，并用带平滑权重的双骨手臂 IK 把穿入的手腕目标移到体表外。
 - 常用参数为 `LODGE_RETARGET_HAND_TORSO_CLEARANCE=0.025` 和 `LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION=0.12`；完整参数及前后指标会写入 `retarget_manifest.json` 和 `rokoko_retarget_report.json`。
 - 修改这些环境变量后必须重启 API；历史任务不会自动应用新配置。
