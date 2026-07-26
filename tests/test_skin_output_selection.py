@@ -104,15 +104,22 @@ def test_catalog_resources():
 def test_intergen_outputs(intergen):
     original_generate = intergen.service.generate
     original_retarget = intergen._run_intergen_retarget_if_requested
+    render_plans = {}
 
-    def fake_generate(_prompt, output_path, **_kwargs):
+    def fake_generate(_prompt, output_path, render_preview=True, **_kwargs):
+        render_plans[output_path.stem] = bool(render_preview)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"temporary-smpl-preview")
         candidate_dir = output_path.parent / "candidates"
         candidate_dir.mkdir(parents=True, exist_ok=True)
-        (candidate_dir / "candidate.mp4").write_bytes(b"candidate")
+        if render_preview:
+            output_path.write_bytes(b"temporary-smpl-preview")
+            (candidate_dir / "candidate.mp4").write_bytes(b"candidate")
         return {
-            "message": "Mock motion completed",
+            "message": (
+                "Mock motion and SMPL completed"
+                if render_preview
+                else "Mock motion completed without SMPL"
+            ),
             "generated_frames": 180,
             "fps": 30,
             "raw_joints_files": [],
@@ -175,6 +182,7 @@ def test_intergen_outputs(intergen):
         task = intergen._tasks[task_id]
         assert task.status == "succeeded"
         assert task.available_skin_ids == skin_ids
+        assert render_plans[task_id] is ("smpl" in skin_ids)
         if "smpl" in skin_ids:
             assert task.output_mp4_path and Path(task.output_mp4_path).is_file()
         else:
@@ -188,11 +196,131 @@ def test_intergen_outputs(intergen):
         results[name] = {
             "available_skin_ids": task.available_skin_ids,
             "smpl_video": bool(task.output_mp4_path),
+            "smpl_render_requested": render_plans[task_id],
             "retarget_video": bool(task.output_retarget_path),
         }
+
+    pair_task_id = "person-pair-retarget-only"
+    pair_skin_ids = ["aj", "ch09_nonpbr"]
+    now = "2026-07-26T00:00:00Z"
+    intergen._tasks[pair_task_id] = intergen.TaskInfo(
+        task_id=pair_task_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+        skin_id=pair_skin_ids[0],
+        requested_skin_ids=pair_skin_ids,
+        person_skin_ids=pair_skin_ids,
+    )
+    pair_req = intergen.GenerateMotionRequest(
+        text="Two people dance.",
+        person_a_skin_id=pair_skin_ids[0],
+        person_b_skin_id=pair_skin_ids[1],
+    )
+    intergen._run_generate_task(pair_task_id, pair_req)
+    pair_task = intergen._tasks[pair_task_id]
+    assert pair_task.status == "succeeded"
+    assert render_plans[pair_task_id] is False
+    assert pair_task.output_mp4_path is None
+    assert pair_task.output_retarget_path and Path(pair_task.output_retarget_path).is_file()
+    results[pair_task_id] = {
+        "person_skin_ids": pair_task.person_skin_ids,
+        "smpl_render_requested": render_plans[pair_task_id],
+        "smpl_video": bool(pair_task.output_mp4_path),
+        "retarget_video": bool(pair_task.output_retarget_path),
+    }
+
+    smpl_pair_task_id = "person-pair-smpl-only"
+    smpl_pair_skin_ids = ["smpl", "smpl"]
+    intergen._tasks[smpl_pair_task_id] = intergen.TaskInfo(
+        task_id=smpl_pair_task_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+        skin_id="smpl",
+        requested_skin_ids=["smpl"],
+        person_skin_ids=smpl_pair_skin_ids,
+    )
+    smpl_pair_req = intergen.GenerateMotionRequest(
+        text="Two people dance.",
+        person_a_skin_id="smpl",
+        person_b_skin_id="smpl",
+    )
+    intergen._run_generate_task(smpl_pair_task_id, smpl_pair_req)
+    smpl_pair_task = intergen._tasks[smpl_pair_task_id]
+    assert smpl_pair_task.status == "succeeded"
+    assert render_plans[smpl_pair_task_id] is True
+    assert smpl_pair_task.output_mp4_path
+    assert Path(smpl_pair_task.output_mp4_path).is_file()
+    assert smpl_pair_task.output_retarget_path is None
+    assert smpl_pair_task.available_skin_ids == ["smpl"]
+    results[smpl_pair_task_id] = {
+        "person_skin_ids": smpl_pair_task.person_skin_ids,
+        "smpl_render_requested": render_plans[smpl_pair_task_id],
+        "smpl_video": bool(smpl_pair_task.output_mp4_path),
+        "retarget_video": bool(smpl_pair_task.output_retarget_path),
+    }
     intergen.service.generate = original_generate
     intergen._run_intergen_retarget_if_requested = original_retarget
     return results
+
+
+def test_intergen_service_retarget_only_skips_candidate_mp4(intergen, task_root):
+    service = intergen.InterGenService()
+    render_flags = []
+
+    class FakeMotionModel:
+        def generate_one_sample(
+            self,
+            _prompt,
+            output_path,
+            motion_frames=None,
+            cfg_weight=None,
+            render_preview=True,
+        ):
+            del motion_frames, cfg_weight
+            render_flags.append(bool(render_preview))
+            raw_dir = Path(output_path).parent / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_paths = []
+            for person_index in (1, 2):
+                raw_path = raw_dir / f"sample_person{person_index}.npy"
+                np.save(raw_path, np.zeros((12, 22, 3), dtype=np.float32))
+                raw_paths.append(str(raw_path))
+            return {
+                "render_mode": "skipped",
+                "message": "Motion generated without preview",
+                "fallback_used": "0",
+                "raw_joints_files": raw_paths,
+                "generated_frames": 12,
+                "fps": 30,
+            }
+
+    service._model = FakeMotionModel()
+    output_path = task_root / "service-retarget-only" / "output" / "result.mp4"
+    original_metrics = intergen._raw_hand_head_collision_metrics
+    try:
+        intergen._raw_hand_head_collision_metrics = lambda _paths: {}
+        result = service.generate(
+            "Two people dance.",
+            output_path,
+            num_samples=1,
+            render_preview=False,
+        )
+    finally:
+        intergen._raw_hand_head_collision_metrics = original_metrics
+
+    assert render_flags == [False]
+    assert result["render_mode"] == "skipped"
+    assert len(result["raw_joints_files"]) == 2
+    assert all(Path(path).is_file() for path in result["raw_joints_files"])
+    assert not output_path.exists()
+    assert not list(output_path.parent.rglob("*.mp4"))
+    return {
+        "render_preview_flags": render_flags,
+        "stable_raw_joint_files": len(result["raw_joints_files"]),
+        "candidate_mp4_files": 0,
+    }
 
 
 def test_intergen_person_skin_manifest(intergen, task_root):
@@ -211,7 +339,6 @@ def test_intergen_person_skin_manifest(intergen, task_root):
 
     output_path = task_root / task_id / "output" / f"{task_id}.mp4"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"preview")
     raw_paths = []
     for person_index in (1, 2):
         raw_path = task_root / task_id / "raw" / f"person{person_index}.npy"
@@ -261,6 +388,7 @@ def test_intergen_person_skin_manifest(intergen, task_root):
     assert manifest_path.is_file(), intergen._tasks[task_id].retarget_message
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["person_skin_ids"] == person_skin_ids
+    assert manifest["source_preview_mp4"] is None
     assert [Path(path).name for path in manifest["target_fbx_files"]] == [
         "Aj (1).fbx",
         "Ch09_nonPBR (1).fbx",
@@ -271,23 +399,41 @@ def test_intergen_person_skin_manifest(intergen, task_root):
     ]
     assert intergen._tasks[task_id].retarget_status == "succeeded"
 
-    try:
-        intergen._resolve_person_skin_profiles(
-            intergen.GenerateMotionRequest(
-                text="Two people dance.",
-                person_a_skin_id="smpl",
-                person_b_skin_id="robot",
-            )
+    smpl_profiles = intergen._resolve_person_skin_profiles(
+        intergen.GenerateMotionRequest(
+            text="Two people dance.",
+            person_a_skin_id="smpl",
+            person_b_skin_id="smpl",
         )
+    )
+    assert [profile["id"] for profile in smpl_profiles] == ["smpl", "smpl"]
+
+    mixed_person_request = intergen.GenerateMotionRequest(
+        text="Two people dance.",
+        person_a_skin_id="smpl",
+        person_b_skin_id="robot",
+    )
+    try:
+        intergen._resolve_person_skin_profiles(mixed_person_request)
     except intergen.SkinCatalogError:
         pass
     else:
-        raise AssertionError("SMPL must not be accepted as a Blender person skin")
+        raise AssertionError("Mixed SMPL and FBX person skins must be rejected")
+
+    try:
+        intergen._validate_request_skins(mixed_person_request)
+    except intergen.HTTPException as exc:
+        assert exc.status_code == 422
+    else:
+        raise AssertionError("Mixed SMPL and FBX person skins must return HTTP 422")
 
     return {
         "person_skin_ids": manifest["person_skin_ids"],
         "target_fbx_files": [Path(path).name for path in manifest["target_fbx_files"]],
         "mapping_files": [Path(path).name for path in manifest["mapping_files"]],
+        "smpl_pair_supported": True,
+        "mixed_smpl_fbx_rejected": True,
+        "mixed_smpl_fbx_http_status": 422,
         "retarget_status": intergen._tasks[task_id].retarget_status,
     }
 
@@ -324,6 +470,12 @@ def main():
             "catalog_resources": test_catalog_resources(),
             "lodge_execution_plan": test_lodge_plans(lodge),
             "intergen_mock_outputs": test_intergen_outputs(intergen),
+            "intergen_retarget_only_generation": (
+                test_intergen_service_retarget_only_skips_candidate_mp4(
+                    intergen,
+                    Path(temp_dir),
+                )
+            ),
             "intergen_person_skin_manifest": test_intergen_person_skin_manifest(
                 intergen,
                 Path(temp_dir),

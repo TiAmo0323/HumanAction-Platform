@@ -32,6 +32,13 @@ All frontend-compatible backend changes must remain reachable through this BAT.
 It configures retarget resources but does not force retarget generation; each
 request's `skin_ids` controls the outputs.
 
+Output selection is applied before preview rendering. A retarget-only request
+samples the two-person motion, saves the joints files, exports BVH, and runs
+Blender/Rokoko without fitting or rendering an intermediate SMPL video. SMPL
+fitting/rendering runs only when the request explicitly includes `smpl`.
+For a retarget-only manifest, `source_preview_mp4` is `null` rather than a
+placeholder path to a file that was never rendered.
+
 Default port is 8001.
 
 ## 3. Runtime Environment
@@ -67,10 +74,21 @@ JSON body example:
       "retarget_strict": false
     }
 
-`person_a_skin_id` and `person_b_skin_id` must be provided together and must
-refer to Blender-retargetable catalog characters. The service exports two BVH
-files and supplies a matching FBX/mapping pair for each person. Legacy
-`skin_ids` and `skin_id` requests remain supported.
+`person_a_skin_id` and `person_b_skin_id` must be provided together. Both may
+be `smpl`, in which case the service renders only the standard two-person SMPL
+preview. Alternatively, both may refer to Blender-retargetable catalog
+characters; the service then skips SMPL rendering, exports two BVH files, and
+supplies a matching FBX/mapping pair for each person. Mixing `smpl` with a
+retargetable character in the same request returns HTTP 422. Legacy `skin_ids`
+and `skin_id` requests remain supported.
+
+SMPL pair example:
+
+    {
+      "text": "Two people meet, shake hands, and walk together.",
+      "person_a_skin_id": "smpl",
+      "person_b_skin_id": "smpl"
+    }
 
 Typical response:
 
@@ -188,9 +206,9 @@ Retarget env options:
 - Generated motion is constrained to 180-210 frames. Short interactions and fencing use 180 frames; combat, dance, and running use 210 frames.
 - SMPL, BVH, and retarget videos use the generated joints frame count instead of independently stretching the video.
 - Retarget character spacing is action-aware. The resolved motion profile, prompt, and spacing are stored in `retarget_manifest.json` and `rokoko_retarget_report.json`.
-- Default mode prioritizes SMPL/SMPLX rendering.
-- If SMPL rendering fails and strict mode is not enabled, API falls back to skeleton rendering.
-- In fallback case, task can still be succeeded, and message may indicate fallback.
+- When `smpl` is requested, the default preview mode prioritizes SMPL/SMPLX rendering.
+- If a requested SMPL preview fails and strict mode is not enabled, API falls back to skeleton rendering.
+- The fallback behavior applies only to requests that include `smpl`; retarget-only requests never enter either preview renderer.
 
 Typical messages:
 

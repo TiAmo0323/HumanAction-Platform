@@ -23,14 +23,14 @@
             </div>
             <div class="dialog-skin-grid" role="listbox" :aria-label="`${person.label}蒙皮`">
               <button
-                v-for="option in retargetOptions"
+                v-for="option in textOptions"
                 :key="option.id"
                 type="button"
                 class="dialog-skin-option"
                 :class="{ active: textDraft[person.key] === option.id }"
                 role="option"
                 :aria-selected="textDraft[person.key] === option.id"
-                @click="textDraft[person.key] = option.id"
+                @click="selectTextSkin(person.key, option.id)"
               >
                 <img v-if="option.thumbnail" :src="option.thumbnail" :alt="`${option.label}预览`" />
                 <span v-else class="dialog-skin-placeholder">{{ option.label.slice(0, 1) }}</span>
@@ -39,7 +39,8 @@
               </button>
             </div>
           </section>
-          <p class="skin-dialog-note">标准人体是独立 SMPL 双人预览，不属于 Blender 角色蒙皮，因此人物 A/B 选择中仅列出五个可重定向角色。</p>
+          <p class="skin-dialog-note">标准人体可以用于文本任务；人物 A/B 需要同时选择标准人体，或同时选择 FBX 角色，当前不支持两类角色同场混合。</p>
+          <p v-if="!textSelectionValid" class="skin-dialog-note invalid">请将人物 A 与人物 B 调整为同一渲染类型后再确认。</p>
         </div>
 
         <div v-else class="audio-skin-panel">
@@ -75,7 +76,14 @@
 
         <footer class="skin-dialog-actions">
           <button type="button" class="dialog-secondary" @click="cancel">取消</button>
-          <button ref="confirmButton" type="submit" class="dialog-primary">确认并开始生成</button>
+          <button
+            ref="confirmButton"
+            type="submit"
+            class="dialog-primary"
+            :disabled="isTextMode && !textSelectionValid"
+          >
+            确认并开始生成
+          </button>
         </footer>
       </form>
     </div>
@@ -106,19 +114,28 @@ const textDraft = reactive({ personA: 'robot', personB: 'y_bot' })
 const audioDraft = ref(['smpl'])
 const audioModeDraft = ref(SINGLE_SKIN_SELECTION)
 const isTextMode = computed(() => props.mode === 'text')
-const retargetOptions = computed(() => props.options.filter((option) => option.outputKind === 'retarget'))
+const textOptions = computed(() => props.options)
+const textSelectionValid = computed(() => {
+  const selectedOptions = [textDraft.personA, textDraft.personB]
+    .map((skinId) => textOptions.value.find((option) => option.id === skinId))
+  return selectedOptions.every(Boolean)
+    && new Set(selectedOptions.map((option) => option.outputKind)).size === 1
+})
 const people = [
   { key: 'personA', badge: 'A', label: '人物 A' },
   { key: 'personB', badge: 'B', label: '人物 B' }
 ]
 
 const initializeDraft = () => {
-  const fallbackA = retargetOptions.value[0]?.id || ''
-  const fallbackB = retargetOptions.value[1]?.id || fallbackA
-  textDraft.personA = retargetOptions.value.some((option) => option.id === props.textPersonSkinIds[0])
+  const fallbackA = textOptions.value.find((option) => option.outputKind === 'retarget')?.id
+    || textOptions.value[0]?.id
+    || ''
+  const fallbackB = textOptions.value.find((option) => option.outputKind === 'retarget' && option.id !== fallbackA)?.id
+    || fallbackA
+  textDraft.personA = textOptions.value.some((option) => option.id === props.textPersonSkinIds[0])
     ? props.textPersonSkinIds[0]
     : fallbackA
-  textDraft.personB = retargetOptions.value.some((option) => option.id === props.textPersonSkinIds[1])
+  textDraft.personB = textOptions.value.some((option) => option.id === props.textPersonSkinIds[1])
     ? props.textPersonSkinIds[1]
     : fallbackB
   audioModeDraft.value = props.audioSelectionMode
@@ -140,6 +157,13 @@ const selectAudioSkin = (skinId) => {
   audioDraft.value = toggleSkinSelection(audioDraft.value, skinId, audioModeDraft.value)
 }
 
+const selectTextSkin = (personKey, skinId) => {
+  textDraft[personKey] = skinId
+  if (!textSelectionValid.value) {
+    window.alert('标准人体暂不能与其他角色混合渲染。请将人物 A 和人物 B 同时选择标准人体，或同时选择其他角色。')
+  }
+}
+
 const toggleAudioMode = () => {
   audioModeDraft.value = audioModeDraft.value === MULTI_SKIN_SELECTION
     ? SINGLE_SKIN_SELECTION
@@ -151,7 +175,7 @@ const cancel = () => emit('cancel')
 
 const confirm = () => {
   if (isTextMode.value) {
-    if (!textDraft.personA || !textDraft.personB) return
+    if (!textDraft.personA || !textDraft.personB || !textSelectionValid.value) return
     emit('confirm', {
       mode: 'text',
       personSkinIds: [textDraft.personA, textDraft.personB]
@@ -223,6 +247,16 @@ const confirm = () => {
   color: #68776e;
   font-size: 0.78rem;
   line-height: 1.5;
+}
+
+.skin-dialog-note.invalid {
+  color: #b34a3c;
+  font-weight: 700;
+}
+
+.dialog-primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .skin-dialog-close {

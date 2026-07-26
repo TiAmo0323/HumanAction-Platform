@@ -19,9 +19,18 @@ const samePair = buildIntergenSkinPayload(
   skinOptions
 )
 assert.deepEqual(samePair.skin_ids, ['robot'])
+const smplPair = buildIntergenSkinPayload(
+  'Two people dance.',
+  ['smpl', 'smpl'],
+  skinOptions
+)
+assert.equal(smplPair.person_a_skin_id, 'smpl')
+assert.equal(smplPair.person_b_skin_id, 'smpl')
+assert.deepEqual(smplPair.skin_ids, ['smpl'])
+assert.equal(smplPair.retarget_enabled, false)
 assert.throws(
   () => buildIntergenSkinPayload('Two people dance.', ['smpl', 'robot'], skinOptions),
-  /retarget skins/
+  /cannot mix SMPL and FBX/
 )
 
 const appSource = readFileSync(new URL('../project/src/App.vue', import.meta.url), 'utf8')
@@ -33,7 +42,10 @@ assert.match(appSource, /person_a_skin_id|buildIntergenSkinPayload/)
 assert.match(dialogSource, /人物 A/)
 assert.match(dialogSource, /人物 B/)
 assert.match(dialogSource, /MULTI_SKIN_SELECTION/)
-assert.match(dialogSource, /option\.outputKind === 'retarget'/)
+assert.match(dialogSource, /v-for="option in textOptions"/)
+assert.match(dialogSource, /标准人体可以用于文本任务/)
+assert.match(dialogSource, /!textSelectionValid/)
+assert.match(dialogSource, /window\.alert\('标准人体暂不能与其他角色混合渲染/)
 assert.match(catalogSource, /支持的角色类型/)
 assert.match(catalogSource, /animation: catalog-scroll/)
 assert.match(catalogSource, /\.skin-catalog-marquee:hover \.skin-catalog-track/)
@@ -45,8 +57,12 @@ console.log(JSON.stringify({
   text_dialog_person_a_skin_id: distinctPair.person_a_skin_id,
   text_dialog_person_b_skin_id: distinctPair.person_b_skin_id,
   duplicate_pair_deduplicates_legacy_skin_ids: samePair.skin_ids,
+  smpl_pair_skin_ids: smplPair.skin_ids,
+  smpl_pair_retarget_enabled: smplPair.retarget_enabled,
+  mixed_smpl_fbx_blocked: true,
+  mixed_smpl_fbx_alert_present: true,
   audio_dialog_keeps_single_multi_logic: true,
-  smpl_excluded_from_person_retarget: true,
+  smpl_included_in_text_person_options: true,
   character_catalog_auto_scroll: true,
   character_preview_click_toggle: true
 }, null, 2))

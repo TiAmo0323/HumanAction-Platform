@@ -133,11 +133,11 @@ class GenerateMotionRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text prompt for two-person motion generation")
     person_a_skin_id: Optional[str] = Field(
         default=None,
-        description="Retarget skin id for InterGen person A; must be provided with person_b_skin_id",
+        description="Skin id for InterGen person A; must be provided with person_b_skin_id",
     )
     person_b_skin_id: Optional[str] = Field(
         default=None,
-        description="Retarget skin id for InterGen person B; must be provided with person_a_skin_id",
+        description="Skin id for InterGen person B; must be provided with person_a_skin_id",
     )
     skin_ids: Optional[List[str]] = Field(
         default=None,
@@ -286,6 +286,7 @@ class LitGenModel(L.LightningModule):
         output_path: str,
         motion_frames: Optional[int] = None,
         cfg_weight: Optional[float] = None,
+        render_preview: bool = True,
     ) -> Dict[str, object]:
         self.model.eval()
         run_device = self._runtime_device()
@@ -332,6 +333,20 @@ class LitGenModel(L.LightningModule):
             raw_path = raw_dir / f"{Path(output_path).stem}_person{person_idx}_joints22.npy"
             np.save(str(raw_path), joints3d.astype(np.float32))
             raw_joints_files.append(str(raw_path.resolve()))
+
+        if not render_preview:
+            fps = _clamp_int(int(os.getenv("INTERGEN_FPS", "30")), 15, 30)
+            target_duration_sec = generated_frames / float(max(fps, 1))
+            print("[Render] skipped by skin selection (retarget-only task)")
+            return {
+                "render_mode": "skipped",
+                "message": "Motion generated; SMPL preview skipped by skin selection",
+                "fallback_used": "0",
+                "raw_joints_files": raw_joints_files,
+                "generated_frames": generated_frames,
+                "fps": fps,
+                "duration_seconds": round(target_duration_sec, 3),
+            }
 
         render_mode = os.getenv("INTERGEN_RENDER_MODE", "smpl").strip().lower()
         body_model_type = os.getenv("INTERGEN_BODY_MODEL", "smplx").strip().lower()
@@ -875,9 +890,12 @@ def _run_intergen_retarget_if_requested(
 ) -> None:
     requested_profiles = _resolve_request_skins(req)
     person_profiles = _resolve_person_skin_profiles(req)
+    person_retarget_profiles = [
+        profile for profile in person_profiles if skin_requires_retarget(profile)
+    ]
     skin_profile = (
-        person_profiles[0]
-        if person_profiles
+        person_retarget_profiles[0]
+        if person_retarget_profiles
         else next(
             (profile for profile in requested_profiles if skin_requires_retarget(profile)),
             None,
@@ -909,14 +927,14 @@ def _run_intergen_retarget_if_requested(
         return
 
     blender_exe = _resolve_optional_path(req.blender_executable, "INTERGEN_BLENDER_EXE")
-    if person_profiles:
+    if person_retarget_profiles:
         target_fbx_files = [
             Path(resolve_skin_resource(PROJECT_ROOT, profile, "target_fbx") or "").resolve()
-            for profile in person_profiles
+            for profile in person_retarget_profiles
         ]
         mapping_files = [
             Path(resolve_skin_resource(PROJECT_ROOT, profile, "mapping_file") or "").resolve()
-            for profile in person_profiles
+            for profile in person_retarget_profiles
         ]
     else:
         profile_target_fbx = resolve_skin_resource(PROJECT_ROOT, skin_profile, "target_fbx")
@@ -963,7 +981,7 @@ def _run_intergen_retarget_if_requested(
         "mapping_file": str(mapping_files[0]),
         "mapping_files": [str(path) for path in mapping_files],
         "raw_joints_files": raw_joints_files,
-        "source_preview_mp4": str(output_path.resolve()),
+        "source_preview_mp4": str(output_path.resolve()) if output_path.exists() else None,
         "output_mp4": str(output_mp4.resolve()),
         "report_path": str(report_path.resolve()),
         "debug_blend": str((retarget_dir / "retarget_debug.blend").resolve()),
@@ -1256,6 +1274,7 @@ class InterGenService:
         num_samples: Optional[int] = None,
         motion_frames: Optional[int] = None,
         cfg_weight: Optional[float] = None,
+        render_preview: bool = True,
     ):
         if self._model is None:
             raise RuntimeError("Model not loaded")
@@ -1281,8 +1300,9 @@ class InterGenService:
                         str(candidate_path),
                         motion_frames=motion_frames,
                         cfg_weight=cfg_weight,
+                        render_preview=render_preview,
                     )
-                    if not candidate_path.exists():
+                    if render_preview and not candidate_path.exists():
                         raise FileNotFoundError(f"Expected sample output not found: {candidate_path}")
                     collision_metrics = _raw_hand_head_collision_metrics(
                         list((result or {}).get("raw_joints_files") or [])
@@ -1290,7 +1310,7 @@ class InterGenService:
                     candidates.append(
                         {
                             "path": candidate_path,
-                            "file_size": candidate_path.stat().st_size,
+                            "file_size": candidate_path.stat().st_size if candidate_path.exists() else 0,
                             "self_collision": collision_metrics,
                             **(result or {}),
                         }
@@ -1298,7 +1318,8 @@ class InterGenService:
 
                 best = _pick_best_candidate(candidates)
                 best_path = Path(best["path"])
-                shutil.copy2(str(best_path), str(output_path))
+                if render_preview:
+                    shutil.copy2(str(best_path), str(output_path))
                 stable_raw_files = []
                 raw_files = best.get("raw_joints_files") or []
                 raw_dir = output_path.parent / "raw"
@@ -1362,15 +1383,10 @@ def _resolve_person_skin_profiles(req) -> List[Dict[str, object]]:
     if not person_ids:
         return []
     profiles = [resolve_skins(PROJECT_ROOT, [skin_id])[0] for skin_id in person_ids]
-    invalid_ids = [
-        str(profile["id"])
-        for profile in profiles
-        if not skin_requires_retarget(profile)
-    ]
-    if invalid_ids:
+    output_kinds = {str(profile.get("output_kind") or "") for profile in profiles}
+    if len(output_kinds) != 1:
         raise SkinCatalogError(
-            "InterGen person skins must be Blender-retargetable characters: "
-            + ", ".join(invalid_ids)
+            "InterGen cannot mix SMPL and Blender-retargetable person skins in one video"
         )
     return profiles
 
@@ -1566,9 +1582,10 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             num_samples=req.num_samples,
             motion_frames=req.motion_frames,
             cfg_weight=req.cfg_weight,
+            render_preview=smpl_requested,
         )
 
-        if not output_path.exists():
+        if smpl_requested and not output_path.exists():
             raise FileNotFoundError(f"Expected output not found: {output_path}")
 
         task_message = (render_result or {}).get("message", "Task completed")

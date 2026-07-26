@@ -21,12 +21,13 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - InterGen 和 LODGE 生成结果均可导出 BVH。
 - Blender 后台调用 Rokoko 插件进行角色重定向。
 - InterGen 已支持两个人物分别导出 BVH，并通过 `person_a_skin_id`、`person_b_skin_id` 分别绑定两套 FBX 和骨骼映射。
+- InterGen 在动作采样后按角色选择分流：纯 FBX 角色任务直接导出 BVH 并进入 Blender/Rokoko，不再先渲染再删除 SMPL 视频；只有请求包含 `smpl` 时才执行 SMPL 拟合与预览渲染。
 - 自动相机取景、核心骨骼旋转平滑、头颈稳定和脚步锁定。
 - 手腕/前臂与头部的自碰撞修正，以及警告级/严重级 BVH 质量门。
 - InterGen 默认输出 6～7 秒动作，并记录帧数、FPS 和实际时长。
 - 重定向人物间距会根据舞蹈、拳击、击剑等动作类型自动调整。
 - 已有 NPY 的 InterGen 任务可以只重试 BVH 和 Blender，无需重新运行动作生成。
-- 前端无输入时只静态展示“支持的角色类型”；文本发送后弹窗分别选择人物 A/B，音频确认后弹窗沿用单选/多选规则。
+- 前端无输入时只静态展示“支持的角色类型”；文本发送后弹窗分别选择人物 A/B，六种角色均可选，音频确认后弹窗沿用单选/多选规则。
 - 统一蒙皮目录已注册 X Bot、AJ、Ch09 nonPBR、Ch46 nonPBR 和 Y Bot 五个重定向角色；前端从两套后端动态加载同一目录。
 - 六个角色类型以自动横向滚动的紧凑缩略图栏展示，鼠标悬停时暂停，点击角色可打开大图预览但不会改变任务选择；生成前弹窗使用“标准人体、粉色机器人、街头少年、绿衣少年、动漫少女、蓝色机器人”等外观标签，底层技术 ID 保持不变。
 - LODGE 音频链路支持音频转 WAV、35 维音乐特征提取、Global/Local 两阶段推理、动作拼接、BVH 导出和单角色重定向。
@@ -39,7 +40,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - InterGen 对训练集中较少见的动作语义不稳定，例如羽毛球、网球和持道具运动。
 - 当前 SMPL/BVH 只描述人体动作，不包含球拍、剑、羽毛球等道具动画。
 - InterGen 的人物 A/B 独立 FBX 与 mapping 契约已经通过模拟清单测试，但仍需补充一条 A/B 不同角色的真实 Blender 成片验收。
-- 标准人体是独立 SMPL 双人预览，当前不能与某个 FBX 角色混合作为文本人物 A/B 的其中一方。
+- 文本人物 A/B 可以同时选择标准人体并生成 SMPL 双人预览，也可以同时选择 FBX 角色进行 Blender 重定向；当前不能让标准人体与某个 FBX 角色在同一视频中混合渲染。
 - LODGE 单任务当前最多生成一份 SMPL 预览和一份重定向视频；音频多选中若勾选多个重定向角色，只会渲染其中第一个，尚未逐个生成多份 FBX 结果。
 - 任务状态主要保存在内存中，API 重启后原任务查询可能返回 404，但任务文件仍保留在磁盘。
 - 前端与两套后端已统一使用 `skin_ids` 多选契约，并通过 `available_skin_ids` 区分任务实际可用结果。
@@ -235,13 +236,13 @@ npm.cmd run test:skin-selection
 这是蒙皮选择链路的快速回归测试。测试会导入真实的 InterGen/LODGE API 模块，但会模拟耗时的模型推理和重定向输出，因此不需要实际启动服务、加载模型或调用 Blender。当前覆盖：
 
 - 单选 `smpl`：只保留 SMPL 视频，不执行机器人重定向。
-- 单选 `robot`：只保留机器人视频，并清理临时 SMPL 及候选预览视频。
+- 单选任一重定向角色：不请求 SMPL 渲染，只保存 joints、导出 BVH 并生成角色视频；回归测试要求候选 MP4 数量为 0。
 - 同时选择 `smpl`、`robot`：生成并保留两类输出。
 - 显式 `skin_ids` 对旧版 `retarget_enabled` 的覆盖规则。
 - 旧版 `retarget_enabled=true` 向双选行为的兼容映射。
 - 任务返回的 `available_skin_ids` 与磁盘上实际保留的视频一致。
 - 人物 A/B 两个角色分别写入 `person_skin_ids`、`target_fbx_files` 和 `mapping_files`。
-- 文本人物字段必须成对提供，且不能选择 `output_kind=smpl`。
+- 文本人物字段必须成对提供；两人可以同为 `output_kind=smpl` 或同为 `output_kind=retarget`，混合类型请求返回 HTTP 422。
 
 在项目根目录运行：
 
@@ -251,7 +252,7 @@ D:\Anaconda\envs\intergen_01\python.exe tests\test_skin_output_selection.py
 
 ### `tests/test_skin_submission_dialog.mjs`
 
-该 Node 测试验证文本人物 A/B 请求载荷、音频单选/多选规则、空闲角色目录不提供选择控件，以及当前 Vue 组件接线：
+该 Node 测试验证文本人物 A/B 请求载荷、SMPL 双选、SMPL/FBX 混选拦截与提示、音频单选/多选规则、空闲角色目录不提供选择控件，以及当前 Vue 组件接线：
 
 ```bat
 node tests\test_skin_submission_dialog.mjs
@@ -392,9 +393,9 @@ npm run dev
 
 前端顶部仅展示当前支持的六种角色类型，不在无输入状态提供选择。实际选择发生在提交确认阶段：
 
-- 文本任务：发送提示词后弹出人物 A/B 双栏选择，每个人物各选择一个可重定向角色；后端在同一个 Blender 场景中分别加载两套 FBX 和 mapping；
+- 文本任务：发送提示词后弹出人物 A/B 双栏选择，每栏均提供“标准人体”和五个 FBX 角色；
 - 音频任务：上传并确认后弹出六项蒙皮选择，保留原单选/多选规则；
-- 标准人体是独立 SMPL 双人预览，不参与文本任务中 Blender FBX 角色的 A/B 混合选择。
+- 人物 A/B 同选标准人体时只生成 SMPL 双人预览；两人同选 FBX 角色时跳过 SMPL 渲染并在同一个 Blender 场景中分别加载 FBX 和 mapping；标准人体与 FBX 形成临时混选时，前端立即弹窗说明限制并禁用确认，用户把另一人物调整为同类角色后可继续提交；绕过前端的混合请求由后端以 HTTP 422 拒绝。
 
 界面左上角品牌为 `SynicShade`，空闲舞台使用“视频预览区”标签。角色条悬停时暂停滚动，点击角色图片可以放大预览，再次点击返回主界面。
 
