@@ -1,5 +1,5 @@
 <template>
-  <section class="skin-selector" aria-labelledby="skin-selector-title">
+  <section class="skin-selector" aria-labelledby="skin-selector-title" @click.stop>
     <div class="skin-selector-copy">
       <span class="skin-selector-kicker">角色外观</span>
       <div>
@@ -26,46 +26,78 @@
       </div>
     </div>
 
-    <div
-      class="skin-options"
-      role="group"
-      :aria-label="isMultiSelect ? '蒙皮多选项' : '蒙皮单选项'"
-    >
+    <div ref="dropdownRoot" class="skin-dropdown">
       <button
-        v-for="option in options"
-        :key="option.id"
         type="button"
-        class="skin-option"
-        :class="{ active: modelValue.includes(option.id), single: !isMultiSelect }"
-        :aria-pressed="modelValue.includes(option.id)"
+        class="skin-dropdown-trigger"
+        :class="{ open: dropdownOpen }"
         :disabled="disabled"
-        @click="toggleOption(option.id)"
+        aria-haspopup="listbox"
+        :aria-expanded="dropdownOpen"
+        aria-controls="skin-dropdown-menu"
+        @click="toggleDropdown"
       >
-        <span class="skin-option-indicator" aria-hidden="true">
-          <span></span>
+        <img
+          v-if="primaryOption?.thumbnail"
+          class="skin-trigger-thumbnail"
+          :src="primaryOption.thumbnail"
+          :alt="`${primaryOption.label} 蒙皮预览`"
+        />
+        <span v-else class="skin-thumbnail-placeholder" aria-hidden="true">
+          {{ primaryOption?.label?.slice(0, 1) || '?' }}
         </span>
-        <span class="skin-option-content">
-          <span class="skin-option-heading">
-            <strong>{{ option.label }}</strong>
-            <small>{{ option.category }}</small>
-          </span>
-          <span class="skin-option-description">{{ option.description }}</span>
+        <span class="skin-trigger-copy">
+          <strong>{{ selectedSummary }}</strong>
         </span>
+        <span class="skin-dropdown-chevron" aria-hidden="true"></span>
       </button>
 
-      <div class="skin-future-note" aria-label="更多蒙皮资源即将接入">
-        <span class="skin-future-icon" aria-hidden="true">＋</span>
-        <span>
-          <strong>更多蒙皮</strong>
-          <small>资源接入后将在这里显示</small>
-        </span>
-      </div>
+      <Transition name="skin-menu">
+        <div
+          v-if="dropdownOpen"
+          id="skin-dropdown-menu"
+          class="skin-dropdown-menu"
+          role="listbox"
+          :aria-multiselectable="isMultiSelect"
+          :aria-label="isMultiSelect ? '选择一个或多个蒙皮' : '选择蒙皮'"
+        >
+          <button
+            v-for="option in options"
+            :key="option.id"
+            type="button"
+            class="skin-dropdown-option"
+            :class="{ active: modelValue.includes(option.id) }"
+            role="option"
+            :aria-selected="modelValue.includes(option.id)"
+            @click="selectOption(option.id)"
+          >
+            <img
+              v-if="option.thumbnail"
+              class="skin-option-thumbnail"
+              :src="option.thumbnail"
+              :alt="`${option.label} 蒙皮预览`"
+            />
+            <span v-else class="skin-thumbnail-placeholder option" aria-hidden="true">
+              {{ option.label.slice(0, 1) }}
+            </span>
+            <span class="skin-option-content">
+              <span class="skin-option-heading">
+                <strong>{{ option.label }}</strong>
+                <small>{{ option.category }}</small>
+              </span>
+            </span>
+            <span class="skin-option-check" aria-hidden="true">
+              {{ modelValue.includes(option.id) ? '✓' : '' }}
+            </span>
+          </button>
+        </div>
+      </Transition>
     </div>
   </section>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   MULTI_SKIN_SELECTION,
   SINGLE_SKIN_SELECTION,
@@ -94,17 +126,35 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['update:modelValue', 'update:selectionMode'])
+const dropdownRoot = ref(null)
+const dropdownOpen = ref(false)
 
 const isMultiSelect = computed(() => props.selectionMode === MULTI_SKIN_SELECTION)
+const selectedOptions = computed(() => (
+  props.modelValue
+    .map((skinId) => props.options.find((option) => option.id === skinId))
+    .filter(Boolean)
+))
+const primaryOption = computed(() => selectedOptions.value[0] || props.options[0])
+const selectedSummary = computed(() => {
+  if (!selectedOptions.value.length) return '请选择蒙皮'
+  if (selectedOptions.value.length === 1) return selectedOptions.value[0].label
+  return `${selectedOptions.value[0].label} 等 ${selectedOptions.value.length} 项`
+})
 const selectionHint = computed(() => (
   isMultiSelect.value
-    ? '多选开启：可同时生成多个蒙皮视频。'
-    : '单选开启：点击新蒙皮会替换当前选项。'
+    ? '下拉菜单中可勾选多个蒙皮。'
+    : '下拉菜单中选择一个蒙皮。'
 ))
 
-const toggleOption = (skinId) => {
+const toggleDropdown = () => {
+  if (!props.disabled) dropdownOpen.value = !dropdownOpen.value
+}
+
+const selectOption = (skinId) => {
   const next = toggleSkinSelection(props.modelValue, skinId, props.selectionMode)
   emit('update:modelValue', next)
+  if (!isMultiSelect.value) dropdownOpen.value = false
 }
 
 const toggleSelectionMode = () => {
@@ -120,6 +170,17 @@ const toggleSelectionMode = () => {
     emit('update:modelValue', nextSelection)
   }
 }
+
+const closeDropdown = (event) => {
+  if (!dropdownRoot.value?.contains(event.target)) dropdownOpen.value = false
+}
+
+watch(() => props.disabled, (disabled) => {
+  if (disabled) dropdownOpen.value = false
+})
+
+onMounted(() => document.addEventListener('click', closeDropdown))
+onBeforeUnmount(() => document.removeEventListener('click', closeDropdown))
 </script>
 
 <style scoped>
@@ -138,7 +199,7 @@ const toggleSelectionMode = () => {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: 220px;
+  min-width: 235px;
 }
 
 .skin-selector-kicker {
@@ -193,12 +254,15 @@ const toggleSelectionMode = () => {
   color: #18774f;
 }
 
-.selection-mode-toggle:focus-visible {
+.selection-mode-toggle:focus-visible,
+.skin-dropdown-trigger:focus-visible,
+.skin-dropdown-option:focus-visible {
   outline: 3px solid rgba(31, 143, 98, 0.2);
   outline-offset: 2px;
 }
 
-.selection-mode-toggle:disabled {
+.selection-mode-toggle:disabled,
+.skin-dropdown-trigger:disabled {
   cursor: not-allowed;
   opacity: 0.62;
 }
@@ -219,18 +283,9 @@ const toggleSelectionMode = () => {
   background: #fff;
 }
 
-.selection-mode-icon i:first-child {
-  left: 0;
-}
-
-.selection-mode-icon i:last-child {
-  right: 0;
-  opacity: 0.35;
-}
-
-.selection-mode-toggle.multi .selection-mode-icon i:last-child {
-  opacity: 1;
-}
+.selection-mode-icon i:first-child { left: 0; }
+.selection-mode-icon i:last-child { right: 0; opacity: 0.35; }
+.selection-mode-toggle.multi .selection-mode-icon i:last-child { opacity: 1; }
 
 .skin-selector-copy p {
   margin: 2px 0 0;
@@ -239,90 +294,144 @@ const toggleSelectionMode = () => {
   line-height: 1.35;
 }
 
-.skin-options {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
+.skin-dropdown {
+  position: relative;
+  width: min(420px, 100%);
+  min-width: 270px;
+  margin-left: auto;
 }
 
-.skin-option,
-.skin-future-note {
-  min-width: 0;
-  min-height: 54px;
-  border-radius: 13px;
-}
-
-.skin-option {
+.skin-dropdown-trigger {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
-  border: 1px solid rgba(27, 72, 48, 0.14);
-  background: rgba(255, 255, 255, 0.82);
+  width: 100%;
+  min-height: 46px;
+  gap: 8px;
+  padding: 5px 10px 5px 6px;
+  border: 1px solid rgba(27, 72, 48, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.9);
   color: #213128;
   font-family: inherit;
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  box-shadow: 0 6px 15px rgba(31, 80, 54, 0.07);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
-.skin-option:hover:not(:disabled) {
-  transform: translateY(-1px);
-  border-color: rgba(31, 143, 98, 0.42);
+.skin-dropdown-trigger:hover:not(:disabled),
+.skin-dropdown-trigger.open {
+  border-color: rgba(31, 143, 98, 0.52);
+  box-shadow: 0 8px 20px rgba(31, 80, 54, 0.12);
 }
 
-.skin-option:focus-visible {
-  outline: 3px solid rgba(31, 143, 98, 0.2);
-  outline-offset: 2px;
+.skin-trigger-thumbnail,
+.skin-option-thumbnail,
+.skin-thumbnail-placeholder {
+  object-fit: cover;
+  border: 1px solid rgba(31, 80, 54, 0.13);
+  background: #edf3ef;
 }
 
-.skin-option:disabled {
-  cursor: not-allowed;
-  opacity: 0.7;
+.skin-trigger-thumbnail,
+.skin-thumbnail-placeholder {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 8px;
 }
 
-.skin-option.active {
-  border-color: rgba(31, 143, 98, 0.68);
-  background: #fff;
-  box-shadow: 0 7px 16px rgba(31, 143, 98, 0.12), inset 0 0 0 1px rgba(31, 143, 98, 0.12);
-}
-
-.skin-option-indicator {
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 18px;
-  border: 1.5px solid #9aaba0;
-  border-radius: 5px;
-}
-
-.skin-option.active .skin-option-indicator {
-  border-color: #1f8f62;
-}
-
-.skin-option.single .skin-option-indicator,
-.skin-option.single .skin-option-indicator span {
-  border-radius: 50%;
-}
-
-.skin-option-indicator span {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  background: transparent;
-}
-
-.skin-option.active .skin-option-indicator span {
-  background: #1f8f62;
-}
-
+.skin-trigger-copy,
 .skin-option-content {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.skin-trigger-copy {
+  flex: 1;
+}
+
+.skin-trigger-copy strong {
+  font-size: 0.88rem;
+}
+
+.skin-thumbnail-placeholder {
+  display: grid;
+  place-items: center;
+  color: #1f8f62;
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.skin-thumbnail-placeholder.option {
+  width: 38px;
+  height: 38px;
+  flex-basis: 38px;
+}
+
+.skin-dropdown-chevron {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-right: 2px solid #668074;
+  border-bottom: 2px solid #668074;
+  transform: rotate(45deg) translateY(-2px);
+  transition: transform 0.18s ease;
+}
+
+.skin-dropdown-trigger.open .skin-dropdown-chevron {
+  transform: rotate(225deg) translate(-2px, -2px);
+}
+
+.skin-dropdown-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 100%;
+  max-height: 388px;
+  overflow-y: auto;
+  padding: 7px;
+  border: 1px solid rgba(31, 91, 60, 0.18);
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 18px 38px rgba(26, 60, 42, 0.2);
+  backdrop-filter: blur(12px);
+}
+
+.skin-dropdown-option {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 50px;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  background: transparent;
+  color: #213128;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.skin-dropdown-option:hover,
+.skin-dropdown-option.active {
+  border-color: rgba(31, 143, 98, 0.22);
+  background: rgba(31, 143, 98, 0.08);
+}
+
+.skin-option-thumbnail {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  border-radius: 8px;
+}
+
+.skin-option-content {
+  flex: 1;
 }
 
 .skin-option-heading {
@@ -331,79 +440,58 @@ const toggleSelectionMode = () => {
   gap: 7px;
 }
 
-.skin-option-heading strong {
-  font-size: 0.84rem;
-}
-
+.skin-option-heading strong { font-size: 0.84rem; }
 .skin-option-heading small {
   color: #1f8f62;
   font-size: 0.64rem;
   font-weight: 700;
 }
 
-.skin-option-description {
-  margin-top: 2px;
-  overflow: hidden;
-  color: #6b786f;
-  font-size: 0.66rem;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.skin-future-note {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
-  border: 1px dashed rgba(87, 106, 94, 0.28);
-  color: #718078;
-}
-
-.skin-future-icon {
+.skin-option-check {
   display: grid;
   place-items: center;
-  width: 25px;
-  height: 25px;
-  flex: 0 0 25px;
-  border-radius: 8px;
-  background: rgba(71, 91, 78, 0.08);
-  font-size: 1rem;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  border: 1px solid rgba(31, 143, 98, 0.28);
+  border-radius: 50%;
+  color: #1f8f62;
+  font-size: 0.75rem;
+  font-weight: 800;
 }
 
-.skin-future-note > span:last-child {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
+.skin-dropdown-option.active .skin-option-check {
+  background: #1f8f62;
+  color: #fff;
 }
 
-.skin-future-note strong {
-  font-size: 0.77rem;
+.skin-menu-enter-active,
+.skin-menu-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  transform-origin: top right;
 }
 
-.skin-future-note small {
-  margin-top: 2px;
-  overflow: hidden;
-  font-size: 0.64rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.skin-menu-enter-from,
+.skin-menu-leave-to {
+  opacity: 0;
+  transform: translateY(-5px) scale(0.98);
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 850px) {
   .skin-selector {
-    align-items: flex-start;
+    align-items: stretch;
     flex-direction: column;
     gap: 8px;
   }
 
-  .skin-selector-copy {
+  .skin-selector-copy,
+  .skin-dropdown {
+    width: 100%;
     min-width: 0;
   }
-}
 
-@media (max-width: 720px) {
-  .skin-options {
-    grid-template-columns: 1fr;
+  .skin-dropdown {
+    margin-left: 0;
   }
 }
 </style>

@@ -1,10 +1,58 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   MULTI_SKIN_SELECTION,
   SINGLE_SKIN_SELECTION,
   normalizeSkinSelection,
   toggleSkinSelection
 } from '../project/src/config/skinSelection.js'
+import { skinOptions } from '../project/src/config/skinOptions.js'
+
+const expectedSkinIds = [
+  'smpl',
+  'robot',
+  'aj',
+  'ch09_nonpbr',
+  'ch46_nonpbr',
+  'y_bot'
+]
+
+const expectedSkinLabels = [
+  '标准人体',
+  '粉色机器人',
+  '街头少年',
+  '绿衣少年',
+  '动漫少女',
+  '蓝色机器人'
+]
+
+const backendSkinCatalog = JSON.parse(
+  readFileSync(new URL('../config/skin_catalog.json', import.meta.url), 'utf8')
+)
+
+assert.deepEqual(
+  skinOptions.map((skin) => skin.id),
+  expectedSkinIds,
+  'frontend fallback catalog must stay aligned with the backend skin catalog'
+)
+
+assert.deepEqual(
+  skinOptions.map((skin) => skin.thumbnail),
+  expectedSkinIds.map((skinId) => `/skin-thumbnails/${skinId}.jpg`),
+  'every registered skin must have a stable dropdown thumbnail URL'
+)
+
+assert.deepEqual(
+  skinOptions.map((skin) => skin.label),
+  expectedSkinLabels,
+  'registered skins must expose user-friendly labels instead of asset filenames'
+)
+
+assert.deepEqual(
+  backendSkinCatalog.skins.map(({ id, label }) => ({ id, label })),
+  skinOptions.map(({ id, label }) => ({ id, label })),
+  'backend and frontend skin catalogs must expose the same user-facing labels'
+)
 
 assert.deepEqual(
   toggleSkinSelection(['smpl'], 'robot', SINGLE_SKIN_SELECTION),
@@ -52,5 +100,7 @@ console.log(JSON.stringify({
   single_robot_click: ['robot'],
   multi_robot_click: ['smpl', 'robot'],
   multi_to_single_keeps_latest: ['robot'],
-  future_skin_supported: true
+  future_skin_supported: true,
+  registered_skin_ids: expectedSkinIds,
+  registered_skin_labels: expectedSkinLabels
 }, null, 2))

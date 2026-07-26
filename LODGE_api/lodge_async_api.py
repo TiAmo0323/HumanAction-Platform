@@ -37,6 +37,7 @@ from shared.skin_catalog import (
     resolve_skins,
     skin_requires_retarget,
 )
+from shared.motion_continuity import smooth_chunk_seams
 
 
 def _default_target_fbx() -> str:
@@ -704,6 +705,34 @@ def _cap_motion_frames_inplace(npy_path: Path, max_frames: int) -> Optional[str]
     return f"Frame count clipped from {frame_count} to {max_frames}"
 
 
+def _smooth_motion_chunk_seams_inplace(npy_path: Path) -> Optional[str]:
+    if not _env_flag("LODGE_MOTION_SEAM_SMOOTHING", True):
+        return None
+
+    data = np.load(str(npy_path), allow_pickle=False)
+    smoothed, report = smooth_chunk_seams(
+        data,
+        chunk_frames=_env_int("LODGE_MOTION_CHUNK_FRAMES", 256),
+        window_frames=_env_int("LODGE_MOTION_SEAM_WINDOW_FRAMES", 8),
+    )
+    boundaries = list(report.get("boundaries") or [])
+    report_path = npy_path.with_name(f"{npy_path.stem}.motion_postprocess.json")
+    if boundaries:
+        raw_path = npy_path.with_name(f"{npy_path.stem}.raw.npy")
+        shutil.copy2(npy_path, raw_path)
+        np.save(str(npy_path), smoothed)
+        report["raw_motion"] = str(raw_path.resolve())
+        report["processed_motion"] = str(npy_path.resolve())
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+    if not boundaries:
+        return None
+    return (
+        f"Smoothed {len(boundaries)} LODGE chunk seam(s) with "
+        f"{report['window_frames']}-frame half windows"
+    )
+
+
 def _retarget_options_from_req(req) -> Dict[str, object]:
     skin_profiles = _resolve_request_skins(req)
     skin_profile = next(
@@ -748,9 +777,10 @@ def _export_bvh_for_npy(
     fps: int,
 ) -> Path:
     target_bvh = target_npy.with_suffix(".bvh")
+    converter = APP_ROOT / "lodge2bvh.py"
     command = [
         python_exe,
-        "lodge2bvh.py",
+        str(converter),
         "--input",
         str(target_npy),
         "--output",
@@ -1188,6 +1218,9 @@ def _render_from_sample_dir(
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
+    seam_note = _smooth_motion_chunk_seams_inplace(target_npy)
+    if seam_note:
+        _update_task(task_id, message=seam_note, progress=75)
     target_bvh = _export_bvh_for_npy(
         task_id=task_id,
         lodge_root=lodge_root,
@@ -1247,6 +1280,9 @@ def _render_from_npy_file(
     clip_note = _cap_motion_frames_inplace(target_npy, _env_int("LODGE_MAX_RENDER_FRAMES", 2000))
     if clip_note:
         _update_task(task_id, message=clip_note, progress=75)
+    seam_note = _smooth_motion_chunk_seams_inplace(target_npy)
+    if seam_note:
+        _update_task(task_id, message=seam_note, progress=75)
     target_bvh = _export_bvh_for_npy(
         task_id=task_id,
         lodge_root=lodge_root,

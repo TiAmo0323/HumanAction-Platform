@@ -131,6 +131,14 @@ except Exception:
 
 class GenerateMotionRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text prompt for two-person motion generation")
+    person_a_skin_id: Optional[str] = Field(
+        default=None,
+        description="Retarget skin id for InterGen person A; must be provided with person_b_skin_id",
+    )
+    person_b_skin_id: Optional[str] = Field(
+        default=None,
+        description="Retarget skin id for InterGen person B; must be provided with person_a_skin_id",
+    )
     skin_ids: Optional[List[str]] = Field(
         default=None,
         description="One or more requested skin ids; takes precedence over legacy skin_id",
@@ -184,6 +192,7 @@ class TaskInfo(BaseModel):
     skin_id: str = "smpl"
     requested_skin_ids: List[str] = Field(default_factory=lambda: ["smpl"])
     available_skin_ids: List[str] = Field(default_factory=list)
+    person_skin_ids: List[str] = Field(default_factory=list)
     message: str = ""
     progress: int = 0
     final_prompt: str = ""
@@ -865,9 +874,14 @@ def _run_intergen_retarget_if_requested(
     motion_prompt: str = "",
 ) -> None:
     requested_profiles = _resolve_request_skins(req)
-    skin_profile = next(
-        (profile for profile in requested_profiles if skin_requires_retarget(profile)),
-        None,
+    person_profiles = _resolve_person_skin_profiles(req)
+    skin_profile = (
+        person_profiles[0]
+        if person_profiles
+        else next(
+            (profile for profile in requested_profiles if skin_requires_retarget(profile)),
+            None,
+        )
     )
     if skin_profile is None:
         _update_task(task_id, retarget_status="skipped", retarget_message="Retarget disabled")
@@ -895,18 +909,30 @@ def _run_intergen_retarget_if_requested(
         return
 
     blender_exe = _resolve_optional_path(req.blender_executable, "INTERGEN_BLENDER_EXE")
-    profile_target_fbx = resolve_skin_resource(PROJECT_ROOT, skin_profile, "target_fbx")
-    profile_mapping_file = resolve_skin_resource(PROJECT_ROOT, skin_profile, "mapping_file")
-    target_fbx = _resolve_optional_path(
-        req.target_fbx,
-        "INTERGEN_TARGET_FBX",
-        profile_target_fbx or _default_target_fbx(),
-    )
-    mapping_file = _resolve_optional_path(
-        req.mapping_file,
-        "INTERGEN_RETARGET_MAPPING",
-        profile_mapping_file or _default_mapping_file(),
-    )
+    if person_profiles:
+        target_fbx_files = [
+            Path(resolve_skin_resource(PROJECT_ROOT, profile, "target_fbx") or "").resolve()
+            for profile in person_profiles
+        ]
+        mapping_files = [
+            Path(resolve_skin_resource(PROJECT_ROOT, profile, "mapping_file") or "").resolve()
+            for profile in person_profiles
+        ]
+    else:
+        profile_target_fbx = resolve_skin_resource(PROJECT_ROOT, skin_profile, "target_fbx")
+        profile_mapping_file = resolve_skin_resource(PROJECT_ROOT, skin_profile, "mapping_file")
+        target_fbx = _resolve_optional_path(
+            req.target_fbx,
+            "INTERGEN_TARGET_FBX",
+            profile_target_fbx or _default_target_fbx(),
+        )
+        mapping_file = _resolve_optional_path(
+            req.mapping_file,
+            "INTERGEN_RETARGET_MAPPING",
+            profile_mapping_file or _default_mapping_file(),
+        )
+        target_fbx_files = [target_fbx]
+        mapping_files = [mapping_file]
     retarget_script = _resolve_optional_path(req.retarget_script, "INTERGEN_RETARGET_SCRIPT", _default_retarget_script())
 
     retarget_dir = task_root / "retarget"
@@ -924,6 +950,7 @@ def _run_intergen_retarget_if_requested(
     manifest = {
         "task_id": task_id,
         "skin_id": str(skin_profile["id"]),
+        "person_skin_ids": [str(profile["id"]) for profile in person_profiles],
         "engine": "blender-rokoko",
         "source_bvh": str(source_bvhs[0].resolve()),
         "source_bvh_files": [str(path.resolve()) for path in source_bvhs],
@@ -931,8 +958,10 @@ def _run_intergen_retarget_if_requested(
             str(path.with_name(f"{path.stem}_bvh_report.json").resolve())
             for path in source_bvhs
         ],
-        "target_fbx": str(target_fbx),
-        "mapping_file": str(mapping_file),
+        "target_fbx": str(target_fbx_files[0]),
+        "target_fbx_files": [str(path) for path in target_fbx_files],
+        "mapping_file": str(mapping_files[0]),
+        "mapping_files": [str(path) for path in mapping_files],
         "raw_joints_files": raw_joints_files,
         "source_preview_mp4": str(output_path.resolve()),
         "output_mp4": str(output_mp4.resolve()),
@@ -1050,7 +1079,7 @@ def _run_intergen_retarget_if_requested(
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    required_paths = [blender_exe, target_fbx, mapping_file, retarget_script, *source_bvhs]
+    required_paths = [blender_exe, retarget_script, *target_fbx_files, *mapping_files, *source_bvhs]
     missing = [str(path) if path is not None else "(empty)" for path in required_paths if path is None or not path.exists()]
     if missing:
         message = "Retarget skipped, missing required path(s): " + "; ".join(missing)
@@ -1314,7 +1343,42 @@ _tasks: Dict[str, TaskInfo] = {}
 _task_lock = threading.Lock()
 
 
+def _requested_person_skin_ids(req) -> List[str]:
+    person_ids = [
+        str(getattr(req, "person_a_skin_id", None) or "").strip(),
+        str(getattr(req, "person_b_skin_id", None) or "").strip(),
+    ]
+    if not any(person_ids):
+        return []
+    if not all(person_ids):
+        raise SkinCatalogError(
+            "person_a_skin_id and person_b_skin_id must be provided together"
+        )
+    return person_ids
+
+
+def _resolve_person_skin_profiles(req) -> List[Dict[str, object]]:
+    person_ids = _requested_person_skin_ids(req)
+    if not person_ids:
+        return []
+    profiles = [resolve_skins(PROJECT_ROOT, [skin_id])[0] for skin_id in person_ids]
+    invalid_ids = [
+        str(profile["id"])
+        for profile in profiles
+        if not skin_requires_retarget(profile)
+    ]
+    if invalid_ids:
+        raise SkinCatalogError(
+            "InterGen person skins must be Blender-retargetable characters: "
+            + ", ".join(invalid_ids)
+        )
+    return profiles
+
+
 def _resolve_request_skins(req) -> List[Dict[str, object]]:
+    person_profiles = _resolve_person_skin_profiles(req)
+    if person_profiles:
+        return list({str(profile["id"]): profile for profile in person_profiles}.values())
     return resolve_skins(
         PROJECT_ROOT,
         getattr(req, "skin_ids", None),
@@ -1730,6 +1794,7 @@ def get_supported_skins() -> Dict[str, object]:
 def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
     skin_profiles = _validate_request_skins(req)
     requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
+    person_skin_ids = _requested_person_skin_ids(req)
     task_id = str(uuid.uuid4())
     now = _utc_now()
     task = TaskInfo(
@@ -1739,6 +1804,7 @@ def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
         updated_at=now,
         skin_id=requested_skin_ids[0],
         requested_skin_ids=requested_skin_ids,
+        person_skin_ids=person_skin_ids,
         message="Task queued",
     )
     with _task_lock:

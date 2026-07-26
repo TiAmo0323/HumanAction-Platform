@@ -1596,8 +1596,16 @@ def main() -> int:
     }
 
     try:
-        target_fbx = Path(manifest["target_fbx"]).resolve()
-        mapping_file = Path(manifest["mapping_file"]).resolve()
+        target_fbx_files = [
+            Path(path).resolve()
+            for path in (manifest.get("target_fbx_files") or [manifest["target_fbx"]])
+        ]
+        mapping_files = [
+            Path(path).resolve()
+            for path in (manifest.get("mapping_files") or [manifest["mapping_file"]])
+        ]
+        if not target_fbx_files or not mapping_files:
+            raise RuntimeError("Retarget manifest must provide target FBX and mapping resources")
         source_bvh_files = manifest.get("source_bvh_files") or [manifest["source_bvh"]]
         output_mp4 = Path(manifest["output_mp4"]).resolve()
         debug_blend = Path(manifest.get("debug_blend") or output_mp4.with_suffix(".blend")).resolve()
@@ -1605,12 +1613,11 @@ def main() -> int:
         max_render_frames = int(manifest.get("max_render_frames") or 0)
         report["motion_profile"] = str(manifest.get("motion_profile") or "default")
         report["motion_prompt"] = str(manifest.get("motion_prompt") or "")
+        report["person_skin_ids"] = list(manifest.get("person_skin_ids") or [])
 
         clear_scene()
         configure_render_settings(manifest, report)
         enable_addons(report)
-        mapping_data = clean_mapping(mapping_file, report)
-
         imported_sources = []
         for source_bvh in source_bvh_files:
             imported_sources.extend(import_bvh(Path(source_bvh).resolve(), fps=fps))
@@ -1622,6 +1629,10 @@ def main() -> int:
         target_armatures = []
         retarget_pairs = []
         for index, source in enumerate(source_armatures, start=1):
+            resource_index = min(index - 1, len(target_fbx_files) - 1)
+            mapping_index = min(index - 1, len(mapping_files) - 1)
+            target_fbx = target_fbx_files[resource_index]
+            mapping_file = mapping_files[mapping_index]
             imported_target = import_fbx(target_fbx)
             imported_target_armatures = find_armatures(imported_target)
             if not imported_target_armatures:
@@ -1630,7 +1641,13 @@ def main() -> int:
             target.name = f"Retarget_Target_{index}"
             target_armatures.append(target)
 
-            pair_report = {"source": source.name, "target": target.name}
+            pair_report = {
+                "source": source.name,
+                "target": target.name,
+                "target_fbx": str(target_fbx),
+                "mapping_file": str(mapping_file),
+            }
+            mapping_data = clean_mapping(mapping_file, pair_report)
             ok = run_rokoko_retarget(source, target, mapping_data, pair_report)
             retarget_pairs.append(pair_report)
             if not ok:

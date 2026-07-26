@@ -35,7 +35,7 @@
       <main class="chat-panel" @click="closeMenus">
         <header class="top-bar">
           <div class="top-title-block">
-            <div class="model-chip">Model: SynicShade</div>
+            <div class="model-chip">SynicShade</div>
             <h2 class="platform-title">“联觉动影”多模态人体运动动画生成平台</h2>
           </div>
           <div class="top-actions">
@@ -90,20 +90,13 @@
           </div>
         </header>
 
-        <SkinSelector
-          :model-value="selectedSkinIds"
-          :options="skinOptions"
-          :disabled="isGenerating"
-          :selection-mode="skinSelectionMode"
-          @update:model-value="selectSkins"
-          @update:selection-mode="skinSelectionMode = $event"
-        />
+        <SkinCatalogBar :options="skinOptions" />
 
         <section class="generation-stage" :class="{ generating: isGenerating }">
           <div class="stage-frame" aria-label="动画展示区">
             <div class="stage-skin-badge">
               <span></span>
-              {{ displayedSkinOption.label }} 蒙皮
+              {{ displayedSkinLabel }}
             </div>
             <video
               v-if="generatedVideoUrl"
@@ -116,7 +109,7 @@
             ></video>
             <div v-else class="stage-empty-state">
               <span class="stage-empty-orb"></span>
-              <strong>等待生成 {{ selectedSkinSummary }} 动画</strong>
+              <strong>等待生成动作动画</strong>
               <small>输入文本或上传音频后开始生成</small>
             </div>
           </div>
@@ -213,19 +206,32 @@
         </form>
       </main>
     </div>
+
+    <SkinSelectionDialog
+      :open="skinDialogOpen"
+      :mode="pendingInputMode"
+      :options="skinOptions"
+      :text-person-skin-ids="textPersonSkinIds"
+      :audio-skin-ids="selectedSkinIds"
+      :audio-selection-mode="skinSelectionMode"
+      @cancel="cancelSkinDialog"
+      @confirm="confirmSkinDialog"
+    />
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, onMounted, ref } from 'vue'
 import axios from 'axios'
-import SkinSelector from './components/SkinSelector.vue'
+import SkinCatalogBar from './components/SkinCatalogBar.vue'
+import SkinSelectionDialog from './components/SkinSelectionDialog.vue'
 import {
   DEFAULT_SKIN_ID,
   getSkinOption,
   skinOptions as defaultSkinOptions
 } from './config/skinOptions'
 import { SINGLE_SKIN_SELECTION } from './config/skinSelection'
+import { buildIntergenSkinPayload } from './features/skinSubmission'
 
 const runtimeHost = (import.meta.env.VITE_API_HOST || (typeof window !== 'undefined' ? window.location.hostname : '47.116.49.93') || '47.116.49.93').trim()
 const runtimeProtocol = (import.meta.env.VITE_API_PROTOCOL || (typeof window !== 'undefined' ? window.location.protocol.replace(':', '') : 'http') || 'http').trim().toLowerCase()
@@ -258,8 +264,11 @@ const taskStatusText = ref('')
 const skinOptions = ref([...defaultSkinOptions])
 const selectedSkinIds = ref([DEFAULT_SKIN_ID])
 const skinSelectionMode = ref(SINGLE_SKIN_SELECTION)
-const activeTaskSkinIds = ref([])
+const textPersonSkinIds = ref(['robot', 'y_bot'])
+const skinDialogOpen = ref(false)
+const pendingInputMode = ref('text')
 const generatedSkinId = ref('')
+const generatedPersonSkinIds = ref([])
 const generatedOutputs = ref({})
 const skinResultNotice = ref('')
 
@@ -279,13 +288,24 @@ const resolutions = [
 
 const resolveSkinOption = (skinId) => getSkinOption(skinId, skinOptions.value)
 const skinLabels = (skinIds) => skinIds.map((skinId) => resolveSkinOption(skinId).label).join(' + ')
-const selectedSkinSummary = computed(() => skinLabels(selectedSkinIds.value))
 const displayedSkinOption = computed(() => resolveSkinOption(generatedSkinId.value || selectedSkinIds.value[0]))
-const generatedAvailableSkinIds = computed(() =>
-  Object.entries(generatedOutputs.value)
+const personSkinSummary = (skinIds) => `人物 A：${resolveSkinOption(skinIds[0]).label} · 人物 B：${resolveSkinOption(skinIds[1]).label}`
+const displayedSkinLabel = computed(() => (
+  generatedPersonSkinIds.value.length === 2
+    ? personSkinSummary(generatedPersonSkinIds.value)
+    : generatedVideoUrl.value
+      ? `${displayedSkinOption.value.label} 蒙皮`
+      : isGenerating.value
+        ? '正在生成蒙皮'
+        : '视频预览区'
+))
+const generatedAvailableSkinIds = computed(() => (
+  generatedPersonSkinIds.value.length === 2
+    ? []
+    : Object.entries(generatedOutputs.value)
     .filter(([, output]) => output?.available)
     .map(([skinId]) => skinId)
-)
+))
 
 const history = ref([])
 
@@ -307,7 +327,8 @@ const loadBackendSkinCatalog = async () => {
     category: skin.category || '角色蒙皮',
     description: skin.description || '',
     outputKind: skin.output_kind,
-    backendMode: skin.backend_mode || 'smplx'
+    backendMode: skin.backend_mode || 'smplx',
+    thumbnail: defaultSkinOptions.find((option) => option.id === skin.id)?.thumbnail || ''
   }))
 
   selectedSkinIds.value = selectedSkinIds.value.filter((skinId) =>
@@ -340,25 +361,6 @@ const applyGeneratedSkin = (skinId, updateStatus = true) => {
   return true
 }
 
-const selectSkins = (skinIds) => {
-  const previousIds = selectedSkinIds.value
-  selectedSkinIds.value = [...skinIds]
-  if (isGenerating.value || !generatedTaskId.value) {
-    skinResultNotice.value = isGenerating.value
-      ? `任务生成期间已锁定为 ${skinLabels(activeTaskSkinIds.value)}。`
-      : ''
-    return
-  }
-
-  const addedSkinId = skinIds.find((skinId) => !previousIds.includes(skinId))
-  const displaySkinId = addedSkinId || skinIds.find((skinId) => generatedOutputs.value[skinId]?.available)
-  if (displaySkinId && !applyGeneratedSkin(displaySkinId)) {
-    const skin = resolveSkinOption(displaySkinId)
-    const output = generatedOutputs.value[displaySkinId]
-    skinResultNotice.value = output?.reason || `${skin.label} 未在当前任务中生成，请重新提交任务。`
-  }
-}
-
 const addHistoryItem = (title) => {
   history.value.unshift({
     id: Date.now(),
@@ -388,9 +390,10 @@ const startNewChat = () => {
   generatedVideoFilePath.value = ''
   generatedTaskId.value = ''
   generatedTaskBaseUrl.value = ''
-  activeTaskSkinIds.value = []
   generatedSkinId.value = ''
+  generatedPersonSkinIds.value = []
   generatedOutputs.value = {}
+  skinDialogOpen.value = false
   skinResultNotice.value = ''
   uploadStatus.value = ''
   isUploadReady.value = false
@@ -399,7 +402,7 @@ const startNewChat = () => {
   addHistoryItem('新建对话')
 }
 
-const sendMessage = async () => {
+const sendMessage = () => {
   if (inputMode.value === 'text' && !prompt.value.trim()) {
     window.alert('请先输入舞蹈描述文本，再点击生成。')
     return
@@ -415,35 +418,62 @@ const sendMessage = async () => {
     return
   }
 
+  if (inputMode.value === 'voice') {
+    window.alert('语音功能暂未开放，请尝试文字或音乐输入。')
+    return
+  }
+
+  pendingInputMode.value = inputMode.value
+  skinDialogOpen.value = true
+}
+
+const cancelSkinDialog = () => {
+  skinDialogOpen.value = false
+}
+
+const confirmSkinDialog = (selection) => {
+  skinDialogOpen.value = false
+  if (selection.mode === 'text') {
+    textPersonSkinIds.value = [...selection.personSkinIds]
+  } else {
+    selectedSkinIds.value = [...selection.skinIds]
+    skinSelectionMode.value = selection.selectionMode
+  }
+  submitGeneration(selection)
+}
+
+const submitGeneration = async (selection) => {
+  const submissionMode = selection.mode
+  const personSkinIds = submissionMode === 'text' ? [...selection.personSkinIds] : []
+  const requestedSkinIds = submissionMode === 'text'
+    ? [...new Set(personSkinIds)]
+    : [...selection.skinIds]
+  const requestedSkins = requestedSkinIds.map(resolveSkinOption)
+  const requestedSkin = requestedSkins[0]
+  const requestedSkinSummary = submissionMode === 'text'
+    ? personSkinSummary(personSkinIds)
+    : skinLabels(requestedSkinIds)
+  const requestsRetarget = requestedSkins.some((skin) => skin.outputKind === 'retarget')
+
   isGenerating.value = true
   isUploadReady.value = false
   generationProgress.value = 10
   taskStatusText.value = '任务已提交，等待后端开始处理...'
   const currentPrompt = prompt.value
-  const requestedSkinIds = [...selectedSkinIds.value]
-  const requestedSkins = requestedSkinIds.map(resolveSkinOption)
-  const requestedSkin = requestedSkins[0]
-  const requestedSkinSummary = skinLabels(requestedSkinIds)
-  const requestsRetarget = requestedSkins.some((skin) => skin.outputKind === 'retarget')
-  activeTaskSkinIds.value = requestedSkinIds
-  skinResultNotice.value = `本次任务只生成：${requestedSkinSummary}`
+  generatedPersonSkinIds.value = []
+  skinResultNotice.value = `本次任务蒙皮：${requestedSkinSummary}`
   prompt.value = ''
 
   try {
     let apiUrl = ''
     let payload = {}
     
-    if (inputMode.value === 'text') {
+    if (submissionMode === 'text') {
       apiUrl = `${intergenApiBase}/v1/intergen/tasks/generate`
-      payload = {
-        text: currentPrompt,
-        skin_ids: requestedSkinIds,
-        skin_id: requestedSkin.id,
-        retarget_enabled: requestsRetarget
-      }
+      payload = buildIntergenSkinPayload(currentPrompt, personSkinIds, skinOptions.value)
       addHistoryItem(`文本驱动 · ${requestedSkinSummary}: ${currentPrompt}`)
     } 
-    else if (inputMode.value === 'music') {
+    else if (submissionMode === 'music') {
       if (!selectedMusicFileObj.value) {
         window.alert('未检测到可上传的音乐文件对象，请重新选择文件。')
         isGenerating.value = false
@@ -494,11 +524,6 @@ const sendMessage = async () => {
 
       payload = formData
       addHistoryItem(`音乐驱动 · ${requestedSkinSummary}: ${musicId}`)
-    } 
-    else if (inputMode.value === 'voice') {
-      window.alert('语音功能暂未开放，请尝试文字或音乐输入。')
-      isGenerating.value = false
-      return
     }
     
     const axiosConfig = payload instanceof FormData
@@ -512,12 +537,13 @@ const sendMessage = async () => {
     const baseUrl = apiUrl.substring(0, apiUrl.lastIndexOf('/tasks') + 6)
 
     // 启动轮询：因为 8001/8002 都是异步生成，需要不断问“好了没”
-    startPolling(taskId, baseUrl, requestedSkinIds)
+    startPolling(taskId, baseUrl, requestedSkinIds, personSkinIds)
 
 
   } catch (error) {
     console.error("请求出错了:", error)
-    window.alert('连接服务器失败，可能未开机或 IP 错误')
+    const detail = error.response?.data?.detail || error.message || '未知错误'
+    window.alert(`任务提交失败：${detail}`)
     generationProgress.value = 0
     isGenerating.value = false
   }
@@ -528,7 +554,7 @@ const handleComposerEnter = () => {
   sendMessage()
 }
 
-const startPolling = (taskId, baseUrl, requestedSkinIds) => {
+const startPolling = (taskId, baseUrl, requestedSkinIds, personSkinIds = []) => {
   // 清除可能存在的旧定时器
   if (window.pollTimer) clearInterval(window.pollTimer)
 
@@ -550,7 +576,13 @@ const startPolling = (taskId, baseUrl, requestedSkinIds) => {
         window.pollTimer = null
         generationProgress.value = 100
         isGenerating.value = false
-        const requestedSummary = skinLabels(requestedSkinIds)
+        const resolvedPersonSkinIds = task.person_skin_ids?.length === 2
+          ? task.person_skin_ids
+          : personSkinIds
+        const isPersonPair = resolvedPersonSkinIds.length === 2
+        const requestedSummary = isPersonPair
+          ? personSkinSummary(resolvedPersonSkinIds)
+          : skinLabels(requestedSkinIds)
         taskStatusText.value = `任务已完成，已按选择生成：${requestedSummary}。`
 
         const retargetPath = task.output_retarget_mp4_path || task.output_retarget_path || ''
@@ -580,24 +612,33 @@ const startPolling = (taskId, baseUrl, requestedSkinIds) => {
             reason: '本次任务没有生成可播放的机器人重定向视频。'
           }
         }
-        taskRequestedSkinIds.forEach((skinId) => {
-          if (!outputs[skinId]) {
-            outputs[skinId] = {
-              available: false,
-              reason: `${resolveSkinOption(skinId).label} 未成功生成。`
+        if (!isPersonPair) {
+          taskRequestedSkinIds.forEach((skinId) => {
+            if (!outputs[skinId]) {
+              outputs[skinId] = {
+                available: false,
+                reason: `${resolveSkinOption(skinId).label} 未成功生成。`
+              }
             }
-          }
-        })
+          })
+        }
         generatedOutputs.value = outputs
         generatedTaskId.value = taskId
         generatedTaskBaseUrl.value = baseUrl
-        const initialSkinId = requestedSkinIds.find((skinId) => outputs[skinId]?.available)
+        generatedPersonSkinIds.value = isPersonPair ? [...resolvedPersonSkinIds] : []
+        const initialSkinId = isPersonPair
+          ? resolvedPersonSkinIds.find((skinId) => outputs[skinId]?.available)
+          : requestedSkinIds.find((skinId) => outputs[skinId]?.available)
         if (initialSkinId) {
           applyGeneratedSkin(initialSkinId, false)
-          const missingSkinIds = requestedSkinIds.filter((skinId) => !outputs[skinId]?.available)
-          if (missingSkinIds.length) {
+          if (isPersonPair) {
+            skinResultNotice.value = `当前展示：${requestedSummary}。`
+          } else {
+            const missingSkinIds = requestedSkinIds.filter((skinId) => !outputs[skinId]?.available)
+            if (missingSkinIds.length) {
             skinResultNotice.value = `当前展示：${resolveSkinOption(initialSkinId).label}；未成功生成：${skinLabels(missingSkinIds)}。`
             taskStatusText.value = '任务部分完成，请查看未成功生成的蒙皮状态。'
+            }
           }
         } else {
           generatedVideoUrl.value = ''

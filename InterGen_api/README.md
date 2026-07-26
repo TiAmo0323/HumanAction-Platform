@@ -62,9 +62,15 @@ JSON body example:
 
     {
       "text": "Two people meet, shake hands, and walk together.",
-      "skin_ids": ["smpl", "robot"],
+      "person_a_skin_id": "aj",
+      "person_b_skin_id": "ch09_nonpbr",
       "retarget_strict": false
     }
+
+`person_a_skin_id` and `person_b_skin_id` must be provided together and must
+refer to Blender-retargetable catalog characters. The service exports two BVH
+files and supplies a matching FBX/mapping pair for each person. Legacy
+`skin_ids` and `skin_id` requests remain supported.
 
 Typical response:
 
@@ -73,9 +79,10 @@ Typical response:
       "status": "queued",
       "created_at": "2026-03-27T12:00:00Z",
       "updated_at": "2026-03-27T12:00:00Z",
-      "skin_id": "smpl",
-      "requested_skin_ids": ["smpl", "robot"],
+      "skin_id": "aj",
+      "requested_skin_ids": ["aj", "ch09_nonpbr"],
       "available_skin_ids": [],
+      "person_skin_ids": ["aj", "ch09_nonpbr"],
       "message": "Task queued",
       "output_mp4_path": null,
       "stderr_tail": ""
@@ -90,6 +97,7 @@ Task response includes these retarget fields:
 - skin_id
 - requested_skin_ids
 - available_skin_ids
+- person_skin_ids
 - output_retarget_path
 - output_retarget_mp4_path
 - retarget_status

@@ -162,9 +162,13 @@ SMPL or retarget video instead of always opening the SMPL preview.
 - `GET /v1/lodge/skins` returns the public skin list used by the frontend.
 - The old `retarget_enabled=true` request remains supported for backward compatibility.
 - Every rendered motion npy is now exported to a same-name BVH in the task input directory.
+- BVH export uses the repository-owned `LODGE_api/lodge2bvh.py`. Generated 6D rotations stay as matrices until the final ZYX Euler conversion, avoiding the numerically unstable matrix/axis-angle round trip near 180-degree rotations.
 - `retarget_enabled=true` remains a legacy compatibility input. Global
   `LODGE_RETARGET_ENABLED` no longer overrides explicit task selection.
 - Retargeting environment variables:
+  - LODGE_MOTION_SEAM_SMOOTHING: enable fixed LODGE chunk-boundary repair before both SMPL and retarget branches. The canonical launcher uses 1.
+  - LODGE_MOTION_CHUNK_FRAMES: generated local-motion chunk size. The canonical launcher uses 256.
+  - LODGE_MOTION_SEAM_WINDOW_FRAMES: half-window on each side of a chunk boundary. The canonical launcher uses 8.
   - LODGE_BLENDER_EXE: Blender executable path.
   - LODGE_TARGET_FBX: target character FBX path. Defaults to D:/HumanAction_Platform/X Bot.fbx when present.
   - LODGE_RETARGET_MAPPING: Rokoko mapping JSON path. Defaults to momask-main/assets/mapping.json.
@@ -173,7 +177,7 @@ SMPL or retarget video instead of always opening the SMPL preview.
   - LODGE_RETARGET_RENDER_ENGINE: Blender render engine. The canonical launcher fixes it to BLENDER_EEVEE_NEXT.
   - LODGE_RETARGET_EEVEE_SAMPLES: Eevee render samples. The canonical launcher uses 32 for the current performance/quality test.
   - LODGE_RETARGET_RESOLUTION_PERCENTAGE: output resolution scale. The canonical launcher fixes it to 100.
-  - LODGE_RETARGET_HAND_TORSO_COLLISION: enable target-space hand-to-torso collision avoidance. Defaults to 1.
+  - LODGE_RETARGET_HAND_TORSO_COLLISION: enable experimental target-space hand-to-torso collision avoidance. The canonical launcher uses 0 because the project accepts occasional baseline penetration and avoids adding IK-induced arm jitter.
   - LODGE_RETARGET_HAND_TORSO_CLEARANCE: hand clearance outside the torso proxy in meters. Defaults to 0.025.
   - LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION: maximum wrist correction per frame in meters. Defaults to 0.12.
 - Audio mux environment variables:
@@ -187,7 +191,8 @@ SMPL or retarget video instead of always opening the SMPL preview.
   reports the applied value in `audio_mux_advance_seconds`. If an upload is too
   short to contain audio after the requested trim, muxing retries with 0 seconds
   rather than failing the completed render.
-- Hand-to-torso collision avoidance builds an animated proxy from the target mesh and uses temporally smoothed two-bone arm IK. Metrics are written to `hand_torso_collision_avoidance` in `rokoko_retarget_report.json`.
+- When explicitly enabled, hand-to-torso collision avoidance builds an animated proxy from the target mesh and uses temporally smoothed two-bone arm IK. Metrics are written to `hand_torso_collision_avoidance` in `rokoko_retarget_report.json`. The implementation remains available for A/B experiments but is disabled by the canonical launcher.
+- Before either selected skin is rendered, chunk seams are repaired on the shared task NPY with raised-cosine quaternion SLERP and a cubic-Hermite root bridge. Frame count, FPS and contact channels stay unchanged. The clipped pre-repair motion is retained as `<song>.raw.npy`, and `<song>.motion_postprocess.json` records every boundary and maximum modification.
 - Task state is kept in memory and will be lost after API restart.
 - Outputs are stored under LODGE_api/task_runs/{task_id}/.
 
@@ -232,8 +237,10 @@ SMPL or retarget video instead of always opening the SMPL preview.
 - 输出目录默认在 LODGE_api/task_runs/{task_id}/。
 - 查询接口返回 progress 字段，可直接驱动前端进度条。
 - 当前统一启动脚本将机器人渲染固定为 Eevee Next、32 samples、100% 分辨率；实际值会同时写入 retarget manifest 和 Blender 报告，便于进行画质和耗时对比。
+- 当前统一启动脚本在 SMPL/机器人共用动作分流前，对每个 256 帧边界使用 8 帧半窗口进行局部过渡；关节采用四元数 SLERP，根轨迹采用三次 Hermite，保持总帧数、FPS、音乐时间轴和 contact 通道不变。
+- 处理前动作保留为 `input/<song>.raw.npy`，边界前后指标写入 `input/<song>.motion_postprocess.json`。BVH 由仓库内 `LODGE_api/lodge2bvh.py` 导出，6D 旋转矩阵直接进入 ZYX 欧拉角转换，不再经过接近 180°时不稳定的轴角中间表示。
 - WAV、MP3 或带音频 MP4 上传任务会在渲染后把原始音乐加入每个所选视频。视频轨直接复制，音频编码为 AAC；特征 NPY 和动作 NPY 没有原始音乐，仍输出静音视频。
 - 音频封装先生成临时文件并验证音视频轨，再原子替换正式 MP4。音乐较长时按视频时长截取，音乐较短时不会截断动作。
-- 推荐启动脚本默认启用目标角色空间的手—躯干防穿模处理。它从 Hips/Spine 蒙皮顶点建立逐帧截面代理，并用带平滑权重的双骨手臂 IK 把穿入的手腕目标移到体表外。
-- 常用参数为 `LODGE_RETARGET_HAND_TORSO_CLEARANCE=0.025` 和 `LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION=0.12`；完整参数及前后指标会写入 `retarget_manifest.json` 和 `rokoko_retarget_report.json`。
+- 推荐启动脚本默认关闭目标角色空间的手—躯干防穿模处理，接受基线动作的偶发穿模，避免腕部 IK 修正放大局部抖动。
+- 防碰撞实现仍保留用于 A/B 实验；显式设为 `LODGE_RETARGET_HAND_TORSO_COLLISION=1` 后，可使用 `LODGE_RETARGET_HAND_TORSO_CLEARANCE=0.025` 和 `LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION=0.12` 等参数，完整指标会写入 `retarget_manifest.json` 和 `rokoko_retarget_report.json`。
 - 修改这些环境变量后必须重启 API；历史任务不会自动应用新配置。

@@ -9,7 +9,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - **Blender + Rokoko**：将 BVH 重定向到 FBX 动漫角色并渲染视频。
 - **Vue 3 + Vite**：提供文本输入、文件上传、进度轮询和视频播放界面。
 
-本文档根据 2026-07-24 的 `main` 分支代码整理；接口、默认参数和限制均以当前实现为准。
+本文档根据 2026-07-26 的当前代码整理；接口、默认参数和限制均以当前实现为准。
 
 ## 当前进度
 
@@ -20,13 +20,15 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - LODGE 支持上传 `mp3`、`mp4`、`wav` 和特征 `npy`。
 - InterGen 和 LODGE 生成结果均可导出 BVH。
 - Blender 后台调用 Rokoko 插件进行角色重定向。
-- InterGen 已支持两个人物分别导出 BVH，并重定向到两个角色。
+- InterGen 已支持两个人物分别导出 BVH，并通过 `person_a_skin_id`、`person_b_skin_id` 分别绑定两套 FBX 和骨骼映射。
 - 自动相机取景、核心骨骼旋转平滑、头颈稳定和脚步锁定。
 - 手腕/前臂与头部的自碰撞修正，以及警告级/严重级 BVH 质量门。
 - InterGen 默认输出 6～7 秒动作，并记录帧数、FPS 和实际时长。
 - 重定向人物间距会根据舞蹈、拳击、击剑等动作类型自动调整。
 - 已有 NPY 的 InterGen 任务可以只重试 BVH 和 Blender，无需重新运行动作生成。
-- 前端蒙皮选择默认采用单选模式，点击机器人会直接替换 SMPL；主动切换为多选模式后才会同时生成多种蒙皮。
+- 前端无输入时只静态展示“支持的角色类型”；文本发送后弹窗分别选择人物 A/B，音频确认后弹窗沿用单选/多选规则。
+- 统一蒙皮目录已注册 X Bot、AJ、Ch09 nonPBR、Ch46 nonPBR 和 Y Bot 五个重定向角色；前端从两套后端动态加载同一目录。
+- 六个角色类型以自动横向滚动的紧凑缩略图栏展示，鼠标悬停时暂停，点击角色可打开大图预览但不会改变任务选择；生成前弹窗使用“标准人体、粉色机器人、街头少年、绿衣少年、动漫少女、蓝色机器人”等外观标签，底层技术 ID 保持不变。
 - LODGE 音频链路支持音频转 WAV、35 维音乐特征提取、Global/Local 两阶段推理、动作拼接、BVH 导出和单角色重定向。
 - LODGE 音频输入任务会把上传的原始音乐以 AAC 音轨加入所选 SMPL/机器人 MP4，视频轨不重新编码。
 - LODGE 推荐启动配置已将普通 SMPL/SMPL-X 预览与重定向视频统一为最多 2000 帧，在 30 FPS 下最长约 66.67 秒。
@@ -36,7 +38,9 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 
 - InterGen 对训练集中较少见的动作语义不稳定，例如羽毛球、网球和持道具运动。
 - 当前 SMPL/BVH 只描述人体动作，不包含球拍、剑、羽毛球等道具动画。
-- 两个重定向角色默认都使用同一个 `X Bot.fbx`，尚未区分性别或角色外观。
+- InterGen 的人物 A/B 独立 FBX 与 mapping 契约已经通过模拟清单测试，但仍需补充一条 A/B 不同角色的真实 Blender 成片验收。
+- 标准人体是独立 SMPL 双人预览，当前不能与某个 FBX 角色混合作为文本人物 A/B 的其中一方。
+- LODGE 单任务当前最多生成一份 SMPL 预览和一份重定向视频；音频多选中若勾选多个重定向角色，只会渲染其中第一个，尚未逐个生成多份 FBX 结果。
 - 任务状态主要保存在内存中，API 重启后原任务查询可能返回 404，但任务文件仍保留在磁盘。
 - 前端与两套后端已统一使用 `skin_ids` 多选契约，并通过 `available_skin_ids` 区分任务实际可用结果。
 - LODGE 特征 NPY 和动作 NPY 输入不包含原始音乐，因此这两类任务仍输出静音视频。
@@ -90,8 +94,14 @@ D:\HumanAction_Platform\
 ├─ InterGen\InterGen_master\
 ├─ LODGE-main\
 ├─ momask-main\
-│  └─ assets\mapping.json
-└─ X Bot.fbx
+│  └─ assets\
+│     ├─ mapping.json
+│     └─ mapping6.json
+├─ X Bot.fbx
+├─ Y Bot.fbx
+├─ Aj (1).fbx
+├─ Ch09_nonPBR (1).fbx
+└─ Ch46_nonPBR (1).fbx
 
 D:\Blender_4.2\
 └─ blender.exe
@@ -108,10 +118,13 @@ HumanAction-Platform-main/
 │  └─ skin_catalog.json                 # InterGen/LODGE 统一蒙皮资源目录
 ├─ shared/
 │  ├─ __init__.py                       # 将 shared 标记为可导入的 Python 包
-│  └─ skin_catalog.py                   # 蒙皮配置加载、校验与资源路径解析
+│  ├─ skin_catalog.py                   # 蒙皮配置加载、校验与资源路径解析
+│  └─ motion_continuity.py              # LODGE 分块边界旋转与根轨迹连续化
 ├─ tests/
 │  ├─ test_skin_output_selection.py     # 后端单选/多选蒙皮快速回归测试
 │  ├─ test_frontend_skin_selection_mode.mjs # 前端单选/多选交互回归测试
+│  ├─ test_skin_submission_dialog.mjs   # 提交后弹窗与人物 A/B 请求测试
+│  ├─ test_lodge_motion_continuity.py   # LODGE 拼接连续性与 BVH 转换测试
 │  └─ test_lodge_audio_mux.py           # LODGE 原始音乐封装与失败保护测试
 ├─ InterGen_api/
 │  ├─ intergen_async_api.py             # 文本生成异步 API
@@ -124,16 +137,21 @@ HumanAction-Platform-main/
 ├─ LODGE_api/
 │  ├─ lodge_async_api.py                # 音乐生成异步 API
 │  ├─ lodge_async_api_cpu.py            # CPU 兼容 API
+│  ├─ lodge2bvh.py                      # 仓库内 6D 旋转到 BVH 转换器
 │  ├─ blender_rokoko_retarget.py        # Blender/Rokoko 重定向脚本
 │  ├─ start_lodge_api_retarget.bat      # 前端配套的唯一标准启动入口
 │  ├─ start_lodge_api_cpu.bat           # CPU 兼容脚本，不作为当前前端入口
 │  ├─ task_runs/                         # LODGE 任务结果
 │  └─ README.md
 └─ project/
-   ├─ src/App.vue
-   ├─ src/components/SkinSelector.vue
-   ├─ src/config/skinOptions.js
-   ├─ src/config/skinSelection.js
+   ├─ public/skin-thumbnails/            # 六个真实任务帧角色图标
+   ├─ src/App.vue                        # SynicShade 主界面与任务状态
+   ├─ src/components/SkinCatalogBar.vue  # 空闲态滚动角色目录与大图预览
+   ├─ src/components/SkinSelectionDialog.vue # 文本 A/B 与音频选择弹窗
+   ├─ src/components/SkinSelector.vue    # 可复用的紧凑单选/多选组件
+   ├─ src/config/skinOptions.js          # 六角色前端回退目录与缩略图
+   ├─ src/config/skinSelection.js        # 单选/多选纯函数
+   ├─ src/features/skinSubmission.js     # 人物 A/B 请求载荷构造
    ├─ BACKEND_CALL_GUIDE.md
    └─ package.json
 ```
@@ -146,6 +164,10 @@ HumanAction-Platform-main/
 
 - `smpl`：`output_kind` 为 `smpl`，保留普通 SMPL/SMPL-X 预览视频。
 - `robot`：`output_kind` 为 `retarget`，调用 Blender/Rokoko 生成机器人重定向视频。
+- `aj`：AJ 卡通人物，使用标准 `mapping.json`。
+- `ch09_nonpbr`：Ch09 nonPBR 角色，使用 `mixamorig6` 对应的 `mapping6.json`。
+- `ch46_nonpbr`：Ch46 nonPBR 角色，使用标准 `mapping.json`；目录只注册 `(1)` 文件，未重复注册同角色的 `(2)` 导出件。
+- `y_bot`：Y Bot 机器人，使用标准 `mapping.json`。
 
 顶层 `default_skin_id` 指定未传入任何蒙皮参数时的默认选项，当前为 `smpl`。每个 `skins` 条目可包含：
 
@@ -162,7 +184,7 @@ HumanAction-Platform-main/
 
 `target_fbx` 和 `mapping_file` 可以使用绝对路径，也可以使用相对于 `config/skin_catalog.json` 所在目录的路径。通过统一目录，前端、InterGen 和 LODGE 不再各自硬编码同一套蒙皮信息。
 
-注意：向 JSON 中增加配置只会让目录能够识别新蒙皮，不会自动实现新的输出链路。若新资源使用 `smpl`、`retarget` 之外的 `output_kind`，或需要在同一任务中同时重定向到多个不同 FBX，仍需扩展对应后端的生成与结果管理逻辑。
+注意：向 JSON 中增加配置只会让目录能够识别新蒙皮，不会自动实现新的输出链路。InterGen 已能为人物 A/B 读取两套不同的 `target_fbx` 和 `mapping_file`；LODGE 仍只消费请求中的第一项重定向角色。若新资源使用 `smpl`、`retarget` 之外的 `output_kind`，仍需扩展对应后端。
 
 ### `shared/__init__.py` 与 `shared/skin_catalog.py`
 
@@ -186,26 +208,22 @@ skin_ids
 
 因此，显式传入 `skin_ids=["smpl"]` 时，即使旧参数 `retarget_enabled=true` 也只生成 SMPL；旧客户端只传 `retarget_enabled=true` 时则兼容为同时请求 `smpl` 和 `robot`。
 
-### 前端单选/多选模式
+### 前端角色展示与提交后选择
 
-`project/src/components/SkinSelector.vue` 提供一个显式模式切换按钮，默认显示
-“单选模式”：
+当前主界面将“支持能力展示”和“本次任务选择”分开：
 
-- 单选模式下始终只保留一项；默认 SMPL 时点击机器人会直接变为
-  `skin_ids=["robot"]`，不会误触为双选；
-- 点击模式按钮切换为多选后，才允许追加或取消蒙皮，但始终至少保留一项；
-- 多选切回单选时保留最近加入的蒙皮；
-- 任务生成期间蒙皮选项与模式切换按钮都会禁用，当前任务继续使用提交时锁定的
-  `skin_ids`；
-- 该切换只改变前端如何组织 `skin_ids`，不改变 InterGen/LODGE 的后端接口。
+- 空闲状态由 `SkinCatalogBar.vue` 展示六种“支持的角色类型”，角色条自动横向循环；鼠标悬停或键盘聚焦时暂停；
+- 点击某个角色会打开居中大图，再次点击、点击遮罩或按 Esc 返回主界面；该操作只查看外观，不改变任务参数；
+- 文本发送后打开 `SkinSelectionDialog.vue`，人物 A、人物 B 各自单选一个 `output_kind=retarget` 的角色；
+- 音频确认后打开同一弹窗，默认单选，可主动切换多选，并复用 `skinSelection.js` 的“至少保留一项”和“切回单选保留最近项”规则；
+- 取消弹窗不会丢失输入文本或上传文件，只有点击“确认并开始生成”才调用后端；
+- 顶栏品牌显示为 `SynicShade`，空闲舞台标签显示为“视频预览区”。
 
-选择规则集中在 `project/src/config/skinSelection.js`，没有把 `smpl` 和 `robot`
-写死在组件逻辑中，因此后续目录新增蒙皮仍可复用相同单选/多选行为。
+`SkinSelector.vue` 保留为可复用紧凑组件，但当前 `App.vue` 不在空闲页面挂载它。角色图标位于 `project/public/skin-thumbnails/`，均从已完成的 `task_runs` 视频帧裁切为 192×192 JPEG；标准人体与粉色机器人使用已人工确认的正面帧。后端动态目录加载后，前端按 `skin_id` 合并本地图标。
 
 ### `tests/test_frontend_skin_selection_mode.mjs`
 
-该 Node 测试覆盖默认 SMPL 切换机器人、主动多选、至少保留一项、多选切回单选
-以及未来蒙皮 ID。运行：
+该 Node 测试覆盖默认 SMPL 切换机器人、主动多选、至少保留一项、多选切回单选、六个注册角色及缩略图映射。运行：
 
 ```bat
 cd project
@@ -222,11 +240,29 @@ npm.cmd run test:skin-selection
 - 显式 `skin_ids` 对旧版 `retarget_enabled` 的覆盖规则。
 - 旧版 `retarget_enabled=true` 向双选行为的兼容映射。
 - 任务返回的 `available_skin_ids` 与磁盘上实际保留的视频一致。
+- 人物 A/B 两个角色分别写入 `person_skin_ids`、`target_fbx_files` 和 `mapping_files`。
+- 文本人物字段必须成对提供，且不能选择 `output_kind=smpl`。
 
 在项目根目录运行：
 
 ```bat
 D:\Anaconda\envs\intergen_01\python.exe tests\test_skin_output_selection.py
+```
+
+### `tests/test_skin_submission_dialog.mjs`
+
+该 Node 测试验证文本人物 A/B 请求载荷、音频单选/多选规则、空闲角色目录不提供选择控件，以及当前 Vue 组件接线：
+
+```bat
+node tests\test_skin_submission_dialog.mjs
+```
+
+### `tests/test_lodge_motion_continuity.py`
+
+该测试验证 LODGE 每 256 帧拼接边界的四元数/根轨迹连续化、帧数与 contact 保持，以及仓库内 `lodge2bvh.py` 的 6D 旋转转换：
+
+```bat
+D:\Anaconda\envs\intergen_01\python.exe tests\test_lodge_motion_continuity.py
 ```
 
 ### `tests/test_lodge_audio_mux.py`
@@ -319,6 +355,9 @@ curl http://127.0.0.1:8002/health
 ```bat
 set "LODGE_MAX_RENDER_FRAMES=2000"
 set "LODGE_RETARGET_MAX_RENDER_FRAMES=2000"
+set "LODGE_MOTION_SEAM_SMOOTHING=1"
+set "LODGE_MOTION_CHUNK_FRAMES=256"
+set "LODGE_MOTION_SEAM_WINDOW_FRAMES=8"
 set "LODGE_RETARGET_RENDER_SIZE=1080x1080"
 set "LODGE_RETARGET_RENDER_ENGINE=BLENDER_EEVEE_NEXT"
 set "LODGE_RETARGET_EEVEE_SAMPLES=32"
@@ -326,10 +365,12 @@ set "LODGE_RETARGET_RESOLUTION_PERCENTAGE=100"
 set "LODGE_AUDIO_MUX_BITRATE=192k"
 set "LODGE_AUDIO_MUX_TIMEOUT_SEC=300"
 set "LODGE_AUDIO_ADVANCE_SEC=2.0"
-set "LODGE_RETARGET_HAND_TORSO_COLLISION=1"
+set "LODGE_RETARGET_HAND_TORSO_COLLISION=0"
 ```
 
-因此新任务的普通预览和重定向视频会使用同一份、最多 2000 帧的动作；实际视频时长取决于动作真实帧数。机器人渲染阶段还会执行目标角色空间的手—躯干防穿模处理。
+因此新任务的普通预览和重定向视频会使用同一份、最多 2000 帧的动作；实际视频时长取决于动作真实帧数。任务动作在进入 SMPL 和机器人分支前，会以 8 帧半窗口对每个 256 帧 LODGE 局部片段边界执行保帧数过渡：关节使用四元数 SLERP，根轨迹使用三次 Hermite，并原样保留 contact 通道。处理前动作保存为 `input/<song>.raw.npy`，指标写入 `input/<song>.motion_postprocess.json`。本项目自带的 `LODGE_api/lodge2bvh.py` 会直接把 6D 旋转矩阵转换成 BVH ZYX 欧拉角，避免接近 180°时矩阵—轴角往返产生错误髋部跳变。
+
+当前接受 LODGE 基线动作可能自带的偶发手—躯干穿模，标准启动脚本默认关闭目标角色 IK 防碰撞，避免人工腕部修正放大局部抖动；实现和环境开关仍保留，后续可按实验需要重新启用。
 音频上传任务会在渲染后把原始上传音乐加入每个所选视频；FFmpeg 按
 `LODGE_FFMPEG_EXE`、系统 `PATH`、`imageio-ffmpeg` 内置程序的顺序查找，
 视频轨直接复制，音频默认编码为 `192k AAC`。
@@ -349,11 +390,13 @@ npm run dev
 
 浏览器打开 Vite 输出的地址，通常是 `http://127.0.0.1:5173`。
 
-前端顶部提供“选择蒙皮”多选区域，当前可选：
+前端顶部仅展示当前支持的六种角色类型，不在无输入状态提供选择。实际选择发生在提交确认阶段：
 
-- 只勾选 `SMPL`：只保留普通 SMPL / SMPL-X 视频；
-- 只勾选 `机器人`：执行重定向且只保留机器人视频；
-- 同时勾选：同时生成两种视频，完成后可在页面切换结果。
+- 文本任务：发送提示词后弹出人物 A/B 双栏选择，每个人物各选择一个可重定向角色；后端在同一个 Blender 场景中分别加载两套 FBX 和 mapping；
+- 音频任务：上传并确认后弹出六项蒙皮选择，保留原单选/多选规则；
+- 标准人体是独立 SMPL 双人预览，不参与文本任务中 Blender FBX 角色的 A/B 混合选择。
+
+界面左上角品牌为 `SynicShade`，空闲舞台使用“视频预览区”标签。角色条悬停时暂停滚动，点击角色图片可以放大预览，再次点击返回主界面。
 
 蒙皮资源以 `config/skin_catalog.json` 为服务端事实来源；前端启动后自动读取
 InterGen/LODGE 的 `/skins` 接口，后端不可用时才回退到
@@ -367,7 +410,7 @@ InterGen/LODGE 的 `/skins` 接口，后端不可用时才回退到
 ```bat
 curl -X POST "http://127.0.0.1:8001/v1/intergen/tasks/generate" ^
   -H "Content-Type: application/json" ^
-  -d "{\"text\":\"双方正在进行激烈的击剑比赛，脚步轻盈，动作敏捷。\",\"skin_ids\":[\"smpl\",\"robot\"]}"
+  -d "{\"text\":\"双方正在进行激烈的击剑比赛，脚步轻盈，动作敏捷。\",\"person_a_skin_id\":\"aj\",\"person_b_skin_id\":\"ch09_nonpbr\"}"
 ```
 
 返回的 `task_id` 用于查询：
@@ -385,6 +428,8 @@ curl "http://127.0.0.1:8001/v1/intergen/tasks/<task_id>"
 - `output_mp4_path`：SMPL 预览。
 - `output_bvh_path`：两个人的 BVH 路径。
 - `output_retarget_path`：双角色重定向视频。
+- `person_skin_ids`：按人物 A/B 顺序回显的角色 ID。
+- `requested_skin_ids` / `available_skin_ids`：请求角色集合与实际生成结果。
 - `retarget_status` / `retarget_message`：重定向状态。
 
 下载 SMPL 预览：
@@ -498,14 +543,14 @@ POST /v1/lodge/tasks/render-from-npy-upload
 `requested_skin_ids` 中实际出现在 `available_skin_ids` 的结果加入播放列表，
 不会回退展示未选择的蒙皮。
 
-LODGE 上传接口使用 multipart form。`skin_ids` 是可重复字段：
+LODGE 上传接口使用 multipart form。`skin_ids` 是可重复字段，例如同时请求标准人体和一个重定向角色：
 
 ```text
 skin_ids=smpl
 skin_ids=robot
 ```
 
-只提交其中一项时只生成对应最终视频；同时提交两项时才生成两种视频。
+只提交其中一项时只生成对应最终视频；同时提交 `smpl` 和一个重定向角色时生成两种视频。当前 LODGE 单任务只有一个重定向输出槽位，多个重定向角色同时出现时只处理请求顺序中的第一项。
 
 ### 音频到视频的处理链
 
@@ -520,9 +565,11 @@ skin_ids=robot
      -> Local/Fine 局部细化
      -> concat_res 拼接完整动作
   -> 复制 <song_id>.npy 到任务目录
-  -> lodge2bvh.py 导出 <song_id>.bvh
-  -> 可选 Blender/Rokoko 重定向
-  -> render.py 生成普通 SMPL/SMPL-X 预览
+  -> 裁剪到最大渲染帧数并保留 <song_id>.raw.npy
+  -> 在共用 NPY 上修复 256 帧拼接边界
+  -> LODGE_api/lodge2bvh.py 直接由 6D 矩阵导出 <song_id>.bvh
+  -> 若选择机器人：Blender/Rokoko 重定向
+  -> 若选择 SMPL：render.py 生成普通 SMPL/SMPL-X 预览
   -> FFmpeg 按视频实际时长加入 uploaded.<ext> 的原始音轨
   -> 验证视频轨和音频轨后原子替换最终 MP4
 ```
@@ -571,6 +618,7 @@ Global/Local 模型及权重目前在每个推理子进程中重新加载，因�
 - `audio_mux_status` / `audio_mux_message`
 - `audio_muxed_skin_ids`
 - `audio_mux_advance_seconds`
+- `requested_skin_ids` / `available_skin_ids`
 - `stdout_tail` / `stderr_tail`
 
 查询任务：
@@ -686,11 +734,14 @@ set "LODGE_TARGET_FBX=D:\HumanAction_Platform\X Bot.fbx"
 set "LODGE_RETARGET_MAPPING=D:\HumanAction_Platform\momask-main\assets\mapping.json"
 set "LODGE_MAX_RENDER_FRAMES=2000"
 set "LODGE_RETARGET_MAX_RENDER_FRAMES=2000"
+set "LODGE_MOTION_SEAM_SMOOTHING=1"
+set "LODGE_MOTION_CHUNK_FRAMES=256"
+set "LODGE_MOTION_SEAM_WINDOW_FRAMES=8"
 set "LODGE_RETARGET_RENDER_SIZE=1080x1080"
 set "LODGE_RETARGET_RENDER_ENGINE=BLENDER_EEVEE_NEXT"
 set "LODGE_RETARGET_EEVEE_SAMPLES=32"
 set "LODGE_RETARGET_RESOLUTION_PERCENTAGE=100"
-set "LODGE_RETARGET_HAND_TORSO_COLLISION=1"
+set "LODGE_RETARGET_HAND_TORSO_COLLISION=0"
 set "LODGE_RETARGET_HAND_TORSO_CLEARANCE=0.025"
 set "LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION=0.12"
 ```
@@ -747,7 +798,8 @@ LODGE 当前没有 `retry-retarget` 接口；历史任务需要手动复用 mani
 
 LODGE 单角色出现手穿过腰部时，先检查 `rokoko_retarget_report.json` 的 `hand_torso_collision_avoidance`：
 
-- `enabled=false`：确认 `LODGE_RETARGET_HAND_TORSO_COLLISION=1` 并重启 API；
+- 当前标准配置为 `enabled=false`：项目接受基线动作的偶发穿模，以避免目标角色 IK 引入额外手臂抖动；
+- 如需实验性启用：设置 `LODGE_RETARGET_HAND_TORSO_COLLISION=1` 并重启 API；
 - 修正后仍有可见穿模：可小幅提高 `LODGE_RETARGET_HAND_TORSO_CLEARANCE`，建议从 `0.025` 每次增加 `0.005 m`；
 - 手被推得过远：降低 `LODGE_RETARGET_HAND_TORSO_CLEARANCE` 或 `LODGE_RETARGET_HAND_TORSO_MAX_CORRECTION`；
 - 检查 `candidate_frame_count_after`、`penetration_after` 和 `wrist_displacement`，不要只凭单帧截图调参。
@@ -811,11 +863,12 @@ InterGen 与 LODGE 始终分别通过 `start_intergen_api_retarget.bat` 和
 
 ## 后续工作建议
 
-- 为新增角色准备独立 FBX 与骨骼映射，并在 `config/skin_catalog.json` 注册蒙皮 ID。
+- 对 AJ、Ch09 nonPBR、Ch46 nonPBR 和 Y Bot 分别运行真实 LODGE/InterGen 视频验收，并根据结果微调骨骼映射。
 - 持久化任务状态，使 API 重启后仍可查询历史任务。
 - 为 LODGE 增加历史任务重定向重试接口，并隔离并发任务的音乐特征和推理输出目录。
 - 为历史 LODGE 静音任务增加无需重新推理或渲染的音频封装重试接口。
 - 增加文本语义评分，而不仅依赖碰撞质量选择候选。
 - 为球类、击剑等持道具动作增加训练数据和 Blender 道具绑定。
 - 增加逐帧双人体表碰撞检测和距离约束。
-- 支持两个不同 FBX 角色及独立骨骼映射。
+- 完成 InterGen 人物 A/B 不同 FBX 与独立骨骼映射的真实成片验收。
+- 扩展 LODGE 结果契约，使一次音频任务可以逐个生成多个重定向角色视频。
