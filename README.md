@@ -20,7 +20,7 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 - LODGE 支持上传 `mp3`、`mp4`、`wav` 和特征 `npy`。
 - InterGen 和 LODGE 生成结果均可导出 BVH。
 - Blender 后台调用 Rokoko 插件进行角色重定向。
-- InterGen 已支持两个人物分别导出 BVH，并通过 `person_a_skin_id`、`person_b_skin_id` 分别绑定两套 FBX 和骨骼映射。
+- InterGen 已支持两个人物分别导出 BVH，并通过 `person_a_skin_id`、`person_b_skin_id` 分别绑定两套 FBX 和骨骼映射；人物 A/B 使用不同 FBX 的真实 Blender 成片已完成验收。
 - InterGen 在动作采样后按角色选择分流：纯 FBX 角色任务直接导出 BVH 并进入 Blender/Rokoko，不再先渲染再删除 SMPL 视频；只有请求包含 `smpl` 时才执行 SMPL 拟合与预览渲染。
 - 自动相机取景、核心骨骼旋转平滑、头颈稳定和脚步锁定。
 - 手腕/前臂与头部的自碰撞修正，以及警告级/严重级 BVH 质量门。
@@ -39,7 +39,6 @@ HumanAction-Platform 是一个面向 Windows 本地运行的多模态人体动�
 
 - InterGen 对训练集中较少见的动作语义不稳定，例如羽毛球、网球和持道具运动。
 - 当前 SMPL/BVH 只描述人体动作，不包含球拍、剑、羽毛球等道具动画。
-- InterGen 的人物 A/B 独立 FBX 与 mapping 契约已经通过模拟清单测试，但仍需补充一条 A/B 不同角色的真实 Blender 成片验收。
 - 文本人物 A/B 可以同时选择标准人体并生成 SMPL 双人预览，也可以同时选择 FBX 角色进行 Blender 重定向；当前不能让标准人体与某个 FBX 角色在同一视频中混合渲染。
 - LODGE 单任务当前最多生成一份 SMPL 预览和一份重定向视频；音频多选中若勾选多个重定向角色，只会渲染其中第一个，尚未逐个生成多份 FBX 结果。
 - 任务状态主要保存在内存中，API 重启后原任务查询可能返回 404，但任务文件仍保留在磁盘。
@@ -871,5 +870,4 @@ InterGen 与 LODGE 始终分别通过 `start_intergen_api_retarget.bat` 和
 - 增加文本语义评分，而不仅依赖碰撞质量选择候选。
 - 为球类、击剑等持道具动作增加训练数据和 Blender 道具绑定。
 - 增加逐帧双人体表碰撞检测和距离约束。
-- 完成 InterGen 人物 A/B 不同 FBX 与独立骨骼映射的真实成片验收。
 - 扩展 LODGE 结果契约，使一次音频任务可以逐个生成多个重定向角色视频。
