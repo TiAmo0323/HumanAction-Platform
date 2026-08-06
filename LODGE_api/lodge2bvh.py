@@ -1,4 +1,4 @@
-"""Convert LODGE motion arrays to BVH without an unstable matrix/axis-angle round trip."""
+"""将 LODGE 动作数组直接转换为 BVH，避免不稳定的矩阵—轴角往返转换。"""
 
 from __future__ import annotations
 
@@ -78,6 +78,7 @@ def matrix_to_zyx_euler_degrees(matrix: np.ndarray) -> np.ndarray:
 
 
 def load_lodge_motion(npy_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """解析 LODGE 特征布局，返回根节点位置和 22 个关节的旋转矩阵。"""
     data = np.load(str(npy_path), allow_pickle=False)
     if data.ndim == 3 and data.shape[0] == 1:
         data = data.squeeze(0)
@@ -104,6 +105,7 @@ def load_lodge_motion(npy_path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def write_bvh(output_path: Path, positions: np.ndarray, rotations: np.ndarray, fps: int) -> None:
+    """按固定 SMPL→BVH22 层级写出骨架、根位移和 ZYX 欧拉旋转。"""
     children = {index: [] for index in range(len(BVH_NAMES))}
     for index, parent in enumerate(BVH_PARENTS):
         if parent >= 0:

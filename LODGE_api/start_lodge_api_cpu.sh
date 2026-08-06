@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# LODGE CPU 兼容启动脚本（Linux/macOS）：关闭 CUDA 并启动 CPU 异步 API。
 # Start LODGE CPU async API.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

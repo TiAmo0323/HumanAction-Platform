@@ -1,3 +1,6 @@
+# LODGE GPU 异步服务主入口。
+# 负责音视频上传、WAV 转换、音乐特征提取、Global/Local 两阶段动作生成、
+# 拼接连续化、SMPL 预览、BVH/角色重定向、原始音轨封装和任务结果下载。
 import shutil
 import subprocess
 import sys
@@ -505,6 +508,7 @@ def _mux_original_audio(
     duration_seconds: float,
     skin_id: str,
 ) -> None:
+    """用 FFmpeg 将原始上传音轨封装进成片；视频流直接复制，失败时保留静音原片。"""
     video_path = video_path.resolve()
     source_audio_path = source_audio_path.resolve()
     if not video_path.is_file():
@@ -706,6 +710,7 @@ def _cap_motion_frames_inplace(npy_path: Path, max_frames: int) -> Optional[str]
 
 
 def _smooth_motion_chunk_seams_inplace(npy_path: Path) -> Optional[str]:
+    """平滑 LODGE 固定分块边界；帧数和 contact 通道保持不变。"""
     if not _env_flag("LODGE_MOTION_SEAM_SMOOTHING", True):
         return None
 
@@ -813,6 +818,7 @@ def _run_retarget_if_requested(
     retarget_options: Optional[Dict[str, object]],
     source_audio_path: Optional[Path] = None,
 ) -> None:
+    """根据 skin_ids 决定是否导出 BVH 并调用 Blender，而非由全局开关强制执行。"""
     options = retarget_options or {}
     enabled = bool(options.get("enabled"))
     if not enabled:
@@ -1402,6 +1408,7 @@ def _run_infer_and_render_task(task_id: str, req: InferAndRenderRequest) -> None
 
 
 def _run_infer_from_audio_task(task_id: str, req: InferFromAudioRequest) -> None:
+    """音频任务主链路：准备 WAV → 提取特征 → LODGE 推理 → 渲染并封装音轨。"""
     try:
         _update_task(task_id, status="running", progress=10, message="Preparing audio features")
 

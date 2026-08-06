@@ -1,3 +1,4 @@
+# LODGE Python 依赖快照；建议使用独立 lodge 环境，避免覆盖 InterGen 的 CUDA/PyTorch 版本。
 # Generated from conda environment: lodge (2026-04-09)
 # This file records pip-installable dependencies with pinned versions.
 # Conda runtime/system libraries (python, openssl, vc runtime, etc.) are not listed here.

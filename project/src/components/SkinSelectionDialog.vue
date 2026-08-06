@@ -1,3 +1,4 @@
+<!-- 任务提交前的角色确认弹窗：文本模式分别选择人物 A/B，音频模式支持单选或多选。 -->
 <template>
   <Transition name="skin-dialog">
     <div v-if="open" class="skin-dialog-backdrop" role="presentation" @click.self="cancel" @keydown.esc="cancel">

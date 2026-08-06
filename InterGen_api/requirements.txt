@@ -1,3 +1,4 @@
+# InterGen Python 依赖快照；建议在独立 conda 环境中安装，避免与 LODGE 依赖混用。
 # Generated from conda environment intergen_01 (2026-04-09)
 # Note: This file keeps package versions close to the provided environment.
 # Conda-only low-level runtime libraries (mkl, openssl, vc runtime, etc.) are not listed here.

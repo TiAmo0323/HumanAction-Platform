@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# InterGen CPU 兼容启动脚本（Linux/macOS）：用于无 CUDA 环境的功能验证。
 # Configure external InterGen source/config paths for this CPU API wrapper.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

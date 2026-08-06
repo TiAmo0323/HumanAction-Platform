@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+REM LODGE 当前推荐启动入口：配置音频处理、动作拼接、BVH、Blender 和 Rokoko 参数。
+REM 实际生成哪些视频由请求 skin_ids 决定；脚本只准备能力和资源路径。
 REM Canonical LODGE API entry point. Retarget resources are configured here,
 REM while each request's skin_ids decides which final videos are generated.
 set "SCRIPT_DIR=%~dp0"

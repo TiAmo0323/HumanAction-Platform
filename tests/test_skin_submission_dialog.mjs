@@ -1,3 +1,4 @@
+// 前端提交契约回归：验证人物 A/B 载荷、同类输出约束和选择弹窗静态结构。
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { skinOptions } from '../project/src/config/skinOptions.js'

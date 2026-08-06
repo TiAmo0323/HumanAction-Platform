@@ -1,3 +1,6 @@
+# InterGen CPU 兼容服务入口。
+# 保留文本生成、任务轮询和普通预览能力，适合无 CUDA 环境的功能验证；
+# 它不是当前前端推荐的生产入口，能力和速度均低于 GPU/重定向版本。
 import os
 import sys
 import socket

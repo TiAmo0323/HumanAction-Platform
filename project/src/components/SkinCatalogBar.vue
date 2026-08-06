@@ -1,3 +1,4 @@
+<!-- 空闲态角色目录：循环展示后端支持的角色，只负责预览，不改变任务选择。 -->
 <template>
   <section class="skin-catalog-bar" aria-labelledby="skin-catalog-title">
     <div class="skin-catalog-copy">

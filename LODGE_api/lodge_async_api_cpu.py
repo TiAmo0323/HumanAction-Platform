@@ -1,3 +1,6 @@
+# LODGE CPU 兼容服务入口。
+# 提供上传、特征提取、CPU 推理和普通预览，主要用于无 CUDA 环境的兼容测试；
+# 当前不具备 GPU 主入口完整的 BVH、Rokoko 重定向与音轨处理契约。
 import shutil
 import subprocess
 import sys

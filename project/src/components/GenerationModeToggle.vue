@@ -1,3 +1,4 @@
+<!-- 生成模式切换组件：通过 v-model 在标准 SMPL 与影视角色编辑模式间切换。 -->
 <template>
   <div class="mode-toggle" role="group" aria-label="生成模式选择">
     <button

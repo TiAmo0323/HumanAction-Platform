@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+REM InterGen GPU 基础启动脚本：解析外部源码、配置和人体模型目录后启动异步 API。
+REM 当前前端生产流程推荐使用带重定向配置的 start_intergen_api_retarget.bat。
 REM Configure external InterGen source/config paths for this API wrapper.
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_ROOT=%SCRIPT_DIR%.."

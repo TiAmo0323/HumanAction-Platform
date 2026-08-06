@@ -1,5 +1,9 @@
+# 前后端蒙皮输出契约的无模型回归测试。
+# 通过替身推理与渲染覆盖 SMPL、五个 FBX 角色、双人角色绑定和重定向分流；
+# 测试不会加载真实生成模型或 Blender，因此不证明最终动作与画面质量。
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -153,6 +157,11 @@ def test_intergen_outputs(intergen):
     intergen._run_intergen_retarget_if_requested = fake_retarget
 
     results = {}
+    full_badminton_translation = (
+        "Two people are playing badminton: Player A serves with a sideways motion and follows through, "
+        "while Player B, on the opposite side, remains in a ready stance and steps toward the incoming shuttlecock."
+    )
+    assert intergen._optimize_prompt_for_intergen(full_badminton_translation) == full_badminton_translation
     cases = {
         "smpl_only": ["smpl"],
         "multi": ["smpl", "robot"],
@@ -181,6 +190,16 @@ def test_intergen_outputs(intergen):
         intergen._run_generate_task(task_id, req)
         task = intergen._tasks[task_id]
         assert task.status == "succeeded"
+        assert task.original_prompt == "Two people dance."
+        assert task.translated_prompt == "Two people dance."
+        assert task.translation_status == "not-needed"
+        assert task.translation_error == ""
+        assert task.baseline_prompt == "Two people are dancing together face to face with synchronized body movements."
+        assert task.seed is not None
+        assert task.experiment_variant == "baseline"
+        assert task.planner_status == "disabled"
+        assert task.experiment_manifest_path
+        assert Path(task.experiment_manifest_path).is_file()
         assert task.available_skin_ids == skin_ids
         assert render_plans[task_id] is ("smpl" in skin_ids)
         if "smpl" in skin_ids:
@@ -260,6 +279,38 @@ def test_intergen_outputs(intergen):
         "smpl_video": bool(smpl_pair_task.output_mp4_path),
         "retarget_video": bool(smpl_pair_task.output_retarget_path),
     }
+
+    translation_task_id = "translation-required-failure"
+    intergen._tasks[translation_task_id] = intergen.TaskInfo(
+        task_id=translation_task_id,
+        status="queued",
+        created_at=now,
+        updated_at=now,
+        skin_id="smpl",
+        requested_skin_ids=["smpl"],
+    )
+    previous_dashscope_key = os.environ.pop("DASHSCOPE_API_KEY", None)
+    try:
+        translation_req = intergen.GenerateMotionRequest(
+            text="两个人正在打羽毛球。",
+            skin_ids=["smpl"],
+            translation_required=True,
+        )
+        intergen._run_generate_task(translation_task_id, translation_req)
+    finally:
+        if previous_dashscope_key is not None:
+            os.environ["DASHSCOPE_API_KEY"] = previous_dashscope_key
+    translation_task = intergen._tasks[translation_task_id]
+    assert translation_task.status == "failed"
+    assert translation_task.translation_status == "skipped"
+    assert "DASHSCOPE_API_KEY" in translation_task.translation_error
+    assert translation_task_id not in render_plans
+    results[translation_task_id] = {
+        "status": translation_task.status,
+        "translation_status": translation_task.translation_status,
+        "generation_called": translation_task_id in render_plans,
+    }
+
     intergen.service.generate = original_generate
     intergen._run_intergen_retarget_if_requested = original_retarget
     return results
@@ -304,14 +355,19 @@ def test_intergen_service_retarget_only_skips_candidate_mp4(intergen, task_root)
         result = service.generate(
             "Two people dance.",
             output_path,
-            num_samples=1,
+            num_samples=2,
             render_preview=False,
+            seed=12345,
         )
     finally:
         intergen._raw_hand_head_collision_metrics = original_metrics
 
-    assert render_flags == [False]
+    assert render_flags == [False, False]
     assert result["render_mode"] == "skipped"
+    assert result["seed"] == 12345
+    assert result["selected_sample"] == 1
+    assert result["num_samples"] == 2
+    assert [item["seed"] for item in result["candidate_summaries"]] == [12345, 12346]
     assert len(result["raw_joints_files"]) == 2
     assert all(Path(path).is_file() for path in result["raw_joints_files"])
     assert not output_path.exists()
@@ -320,6 +376,149 @@ def test_intergen_service_retarget_only_skips_candidate_mp4(intergen, task_root)
         "render_preview_flags": render_flags,
         "stable_raw_joint_files": len(result["raw_joints_files"]),
         "candidate_mp4_files": 0,
+    }
+
+
+def test_intergen_candidate_audit_retains_all_samples(intergen, task_root):
+    service = intergen.InterGenService()
+
+    class FakeMotionModel:
+        def generate_one_sample(
+            self,
+            _prompt,
+            output_path,
+            motion_frames=None,
+            cfg_weight=None,
+            render_preview=True,
+        ):
+            del motion_frames, cfg_weight
+            path = Path(output_path)
+            raw_dir = path.parent / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_paths = []
+            for person_index in (1, 2):
+                raw_path = raw_dir / f"{path.stem}_person{person_index}.npy"
+                np.save(raw_path, np.zeros((12, 22, 3), dtype=np.float32))
+                raw_paths.append(str(raw_path))
+            if render_preview:
+                path.write_bytes(f"video-{path.stem}".encode("utf-8"))
+            return {
+                "render_mode": "mock",
+                "message": "Mock candidate generated",
+                "fallback_used": "0",
+                "raw_joints_files": raw_paths,
+                "generated_frames": 12,
+                "fps": 30,
+            }
+
+    service._model = FakeMotionModel()
+    original_metrics = intergen._raw_hand_head_collision_metrics
+    original_keep_all = os.environ.pop("INTERGEN_KEEP_ALL_SAMPLES", None)
+    original_audit_samples = os.environ.pop("INTERGEN_AUDIT_NUM_SAMPLES", None)
+    try:
+        intergen._raw_hand_head_collision_metrics = lambda _paths: {}
+        audit_output = task_root / "candidate-audit" / "result.mp4"
+        audit_result = service.generate(
+            "Two people play badminton.",
+            audit_output,
+            render_preview=True,
+            seed=100,
+            candidate_audit=True,
+        )
+        default_output = task_root / "candidate-default" / "result.mp4"
+        default_result = service.generate(
+            "Two people play badminton.",
+            default_output,
+            num_samples=3,
+            render_preview=True,
+            seed=200,
+        )
+    finally:
+        intergen._raw_hand_head_collision_metrics = original_metrics
+        if original_keep_all is not None:
+            os.environ["INTERGEN_KEEP_ALL_SAMPLES"] = original_keep_all
+        if original_audit_samples is not None:
+            os.environ["INTERGEN_AUDIT_NUM_SAMPLES"] = original_audit_samples
+
+    audit_candidates = list((audit_output.parent / "candidates").glob("*.mp4"))
+    default_candidates = list((default_output.parent / "candidates").glob("*.mp4"))
+    assert len(audit_candidates) == 8
+    assert all(item["retained"] is True for item in audit_result["candidate_summaries"])
+    assert audit_result["candidate_audit"] is True
+    assert len(default_candidates) == 1
+    assert sum(item["retained"] is True for item in default_result["candidate_summaries"]) == 1
+    assert default_result["candidate_audit"] is False
+    return {
+        "audit_candidate_videos": len(audit_candidates),
+        "default_candidate_videos": len(default_candidates),
+        "audit_retained_flags": [
+            item["retained"] for item in audit_result["candidate_summaries"]
+        ],
+    }
+
+
+def test_intergen_candidate_audit_review_contract(intergen, task_root):
+    task_id = "candidate-audit-review"
+    task_dir = task_root / task_id
+    candidate_video = task_dir / "output" / "candidates" / "sample1.mp4"
+    candidate_video.parent.mkdir(parents=True, exist_ok=True)
+    candidate_video.write_bytes(b"candidate-video")
+    audit_path = task_dir / "output" / "candidate_audit.json"
+    audit_payload = {
+        "status": "awaiting-human-review",
+        "summary": {
+            "candidate_count": 1,
+            "human_reviewed_count": 0,
+            "semantic_pass_count": 0,
+            "gate_decision": "pending-human-review",
+        },
+        "candidates": [
+            {
+                "candidate_index": 1,
+                "human_review": {"review_status": "pending", "semantic_pass": None},
+            }
+        ],
+    }
+    audit_path.write_text(json.dumps(audit_payload), encoding="utf-8")
+    now = "2026-07-27T00:00:00Z"
+    intergen._tasks[task_id] = intergen.TaskInfo(
+        task_id=task_id,
+        status="succeeded",
+        created_at=now,
+        updated_at=now,
+        candidate_audit=True,
+        candidate_audit_manifest_path=str(audit_path),
+        candidate_summaries=[
+            {"candidate_index": 1, "file_path": str(candidate_video), "retained": True}
+        ],
+    )
+    assert intergen.get_candidate_audit(task_id)["status"] == "awaiting-human-review"
+    result = intergen.review_candidate(
+        task_id,
+        1,
+        intergen.CandidateReviewRequest(
+            mutual_facing=True,
+            racket_swing_proxy=False,
+            receiver_ready_and_reacts=False,
+            role_consistency=True,
+            badminton_semantic_match=False,
+            reviewer="test",
+            notes="Generic arm movement only.",
+        ),
+    )
+    assert result["human_review"]["semantic_pass"] is False
+    assert result["summary"]["gate_decision"] == (
+        "no-qualifying-candidate-refine-planner-or-structured-prompt"
+    )
+    response = intergen.download_task_candidate(task_id, 1)
+    assert Path(response.path) == candidate_video
+    saved = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert saved["status"] == "no-qualifying-candidate"
+    return {
+        "review_status": result["human_review"]["review_status"],
+        "semantic_pass": result["human_review"]["semantic_pass"],
+        "gate_decision": result["summary"]["gate_decision"],
+        "candidate_download_file": Path(response.path).name,
     }
 
 
@@ -438,6 +637,43 @@ def test_intergen_person_skin_manifest(intergen, task_root):
     }
 
 
+def test_intergen_default_motion_frames(intergen):
+    model = object.__new__(intergen.LitGenModel)
+    env_keys = (
+        "INTERGEN_DEFAULT_MOTION_FRAMES",
+        "INTERGEN_MIN_MOTION_FRAMES",
+        "INTERGEN_MAX_MOTION_FRAMES",
+        "INTERGEN_MOTION_FRAMES",
+    )
+    original_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["INTERGEN_MIN_MOTION_FRAMES"] = "180"
+        os.environ["INTERGEN_MAX_MOTION_FRAMES"] = "210"
+        os.environ["INTERGEN_MOTION_FRAMES"] = "180"
+
+        resolved_defaults = {}
+        for frames in (180, 300, 360):
+            os.environ["INTERGEN_DEFAULT_MOTION_FRAMES"] = str(frames)
+            resolved = model._resolve_window_size("identical prompt", None)
+            assert resolved == frames
+            resolved_defaults[str(frames)] = resolved
+
+        os.environ["INTERGEN_DEFAULT_MOTION_FRAMES"] = "360"
+        assert model._resolve_window_size("identical prompt", 180) == 180
+        assert model._resolve_window_size("identical prompt", 200) == 200
+        return {
+            "resolved_defaults": resolved_defaults,
+            "explicit_180_overrides_default_360": True,
+            "explicit_200_overrides_default_360": True,
+        }
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main():
     compile(
         (REPO_ROOT / "LODGE_api" / "blender_rokoko_retarget.py").read_text(encoding="utf-8"),
@@ -476,10 +712,19 @@ def main():
                     Path(temp_dir),
                 )
             ),
+            "intergen_candidate_audit": test_intergen_candidate_audit_retains_all_samples(
+                intergen,
+                Path(temp_dir),
+            ),
+            "intergen_candidate_audit_review": test_intergen_candidate_audit_review_contract(
+                intergen,
+                Path(temp_dir),
+            ),
             "intergen_person_skin_manifest": test_intergen_person_skin_manifest(
                 intergen,
                 Path(temp_dir),
             ),
+            "intergen_default_motion_frames": test_intergen_default_motion_frames(intergen),
         }
     assert results["contract_resolution"]["explicit_smpl_overrides_legacy_flag"] == ["smpl"]
     assert results["contract_resolution"]["legacy_retarget_requests_both"] == ["smpl", "robot"]

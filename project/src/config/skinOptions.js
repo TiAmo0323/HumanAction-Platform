@@ -1,3 +1,5 @@
+// 前端角色目录的离线回退值；正常运行时以后端 /skins 返回的目录为准。
+// outputKind 决定请求走 SMPL 预览还是 Blender/Rokoko 重定向链路。
 export const DEFAULT_SKIN_ID = 'smpl'
 
 export const skinOptions = Object.freeze([

@@ -1,3 +1,5 @@
+<!-- 主界面：组织文本/音频输入、角色确认、异步任务轮询、历史记录和视频播放。 -->
+<!-- 组件只负责交互与请求编排，动作生成、BVH 和重定向均由两套后端完成。 -->
 <template>
   <div class="viewport-frame">
     <div class="page-shell">

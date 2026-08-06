@@ -1,3 +1,4 @@
+<!-- 可复用角色选择器：实现至少保留一项、单选替换和显式多选等交互约束。 -->
 <template>
   <section class="skin-selector" aria-labelledby="skin-selector-title" @click.stop>
     <div class="skin-selector-copy">

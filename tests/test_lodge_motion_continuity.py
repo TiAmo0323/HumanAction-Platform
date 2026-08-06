@@ -1,3 +1,6 @@
+# LODGE 动作连续性回归测试。
+# 验证 6D 旋转转换、分块边界平滑、帧数/contact 保持和 BVH 转换入口；
+# 数值通过只能证明数据连续性，不代替 Blender 成片的主观验收。
 import importlib.util
 import json
 import os

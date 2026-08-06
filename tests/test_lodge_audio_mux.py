@@ -1,3 +1,6 @@
+# LODGE 音轨封装回归测试。
+# 使用短媒体和替身任务验证 FFmpeg 封装、失败保护、音轨提前量与视频流不重编码；
+# 不运行真实 LODGE 模型，也不代表长视频的最终听感已经验收。
 import importlib.util
 import json
 import os

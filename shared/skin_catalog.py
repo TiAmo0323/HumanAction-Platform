@@ -1,3 +1,5 @@
+# InterGen 与 LODGE 共用的角色目录解析器。
+# 统一处理默认角色、旧参数兼容、skin_ids 去重、公开字段过滤和本地资源路径解析。
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,7 @@ def catalog_path(project_root: Path) -> Path:
 
 
 def load_skin_catalog(project_root: Path) -> Tuple[Path, Dict[str, Dict[str, object]]]:
+    """读取并验证角色目录，拒绝重复 ID、未知输出类型和无效默认角色。"""
     path = catalog_path(project_root)
     if not path.is_file():
         raise SkinCatalogError(f"Skin catalog not found: {path}")
@@ -75,6 +78,7 @@ def resolve_skins(
     skin_id: Optional[str] = None,
     legacy_retarget_enabled: bool = False,
 ) -> List[Dict[str, object]]:
+    """按新旧请求参数优先级解析角色集合，并保持用户选择顺序。"""
     _, skins = load_skin_catalog(project_root)
     requested_ids = [str(value or "").strip() for value in (skin_ids or [])]
     requested_ids = [value for value in requested_ids if value]

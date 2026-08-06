@@ -1,4 +1,4 @@
-"""Continuity-preserving post-processing for chunked LODGE motion arrays."""
+"""LODGE 分块动作的连续性后处理：平滑拼接处旋转和根轨迹，同时保持帧数不变。"""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def smooth_chunk_seams(
     chunk_frames: int = 256,
     window_frames: int = 8,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Bridge fixed chunk boundaries without changing frame count or contact values."""
+    """在固定分块边界用 SLERP/Hermite 平滑过渡，不改变帧数或 contact 值。"""
     original = np.asarray(motion)
     if original.ndim != 2:
         raise ValueError(f"Expected a 2D motion array, got shape={original.shape}")

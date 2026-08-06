@@ -1,3 +1,4 @@
+// 角色单选/多选的纯函数规则，供组件和 Node 回归测试共同复用。
 export const SINGLE_SKIN_SELECTION = 'single'
 export const MULTI_SKIN_SELECTION = 'multi'
 

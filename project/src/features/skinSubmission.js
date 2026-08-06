@@ -1,3 +1,4 @@
+// 根据人物 A/B 的角色选择构造生产文本请求，并在前端阻止 SMPL/FBX 混合渲染。
 export function buildIntergenSkinPayload(text, personSkinIds, options) {
   const [personASkinId, personBSkinId] = personSkinIds
   const optionById = new Map(options.map((option) => [option.id, option]))

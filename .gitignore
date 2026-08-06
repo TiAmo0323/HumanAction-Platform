@@ -1,3 +1,4 @@
+# 忽略本地缓存、环境、生成产物和不应提交的任务结果。
 # Python caches and local environments
 __pycache__/
 *.py[cod]

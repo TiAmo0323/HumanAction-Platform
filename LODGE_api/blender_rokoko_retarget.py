@@ -1,3 +1,6 @@
+# 该脚本由 Blender 的 Python 解释器执行，不应直接用普通 Python 启动。
+# 它读取任务 manifest，导入 BVH/FBX，配置 Rokoko 骨骼映射，执行重定向、
+# 相机灯光、旋转平滑、脚步锁定和可选碰撞修正，最后渲染 MP4 并写报告。
 import argparse
 import json
 import math
@@ -73,6 +76,7 @@ def find_armatures(objects=None) -> list:
 
 
 def clean_mapping(mapping_path: Path, report: dict) -> dict:
+    """清洗骨骼映射并过滤空值，避免无效映射进入 Rokoko 操作器。"""
     if not mapping_path.exists():
         return {}
     data = json.loads(mapping_path.read_text(encoding="utf-8"))
@@ -272,6 +276,7 @@ def _look_at(obj, target_point: Vector) -> None:
 
 
 def setup_camera_and_lights(targets, report: dict):
+    """根据所有目标角色的世界包围盒自动布置相机和基础灯光。"""
     if not isinstance(targets, (list, tuple)):
         targets = [targets]
     related = []
@@ -518,6 +523,7 @@ def apply_core_rotation_smoothing(
     profiles: dict,
     report: dict,
 ) -> None:
+    """对核心骨骼四元数做符号连续化、球面插值平滑和旋转步长限制。"""
     if not profiles:
         return
     core_keywords = ("hips", "spine", "waist", "pelvis", "abdomen", "chest", "neck", "head")
@@ -970,6 +976,7 @@ def apply_foot_contact_locking(
     max_correction: float,
     report: dict,
 ) -> None:
+    """从脚部高度和速度估计接触区间，并用临时约束减轻可见滑步。"""
     if not enabled:
         report["foot_contact_locking"] = {"enabled": False}
         return
@@ -1515,6 +1522,7 @@ def apply_hand_torso_collision_avoidance(
 
 
 def configure_render_settings(manifest: dict, report: dict) -> None:
+    """将 manifest 中的尺寸、引擎、采样率和帧范围写入 Blender 场景。"""
     scene = bpy.context.scene
     requested_engine = str(manifest.get("render_engine") or "").strip()
     if requested_engine:

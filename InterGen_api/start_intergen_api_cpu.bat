@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+REM InterGen CPU 兼容启动脚本：强制使用 CPU，主要用于无 CUDA 环境的功能检查。
+REM CPU 推理速度较慢，输出能力也不等同于推荐的 GPU/重定向入口。
 REM Configure external InterGen source/config paths for this CPU API wrapper.
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_ROOT=%SCRIPT_DIR%.."

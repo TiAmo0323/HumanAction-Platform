@@ -1,3 +1,4 @@
+# 统一文本文件换行符；Windows BAT 使用 CRLF，其余源码统一 LF。
 * text=auto
 
 *.py text eol=lf

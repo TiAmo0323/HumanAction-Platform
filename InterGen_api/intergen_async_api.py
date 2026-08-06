@@ -1,3 +1,6 @@
+# InterGen GPU 异步服务主入口。
+# 负责文本翻译与规范化、双人动作采样、SMPL 预览、BVH 导出、角色重定向、
+# 任务状态管理和结果下载；耗时任务由单线程执行器串行执行，避免并发占满显存。
 import os
 import sys
 import socket
@@ -5,6 +8,8 @@ import threading
 import traceback
 import uuid
 import re
+import random
+import secrets
 import shutil
 import json
 import subprocess
@@ -101,6 +106,28 @@ from shared.skin_catalog import (
     resolve_skins,
     skin_requires_retarget,
 )
+# 【实验功能，未应用于实际生产默认逻辑链路】
+# Motion Planner 与候选审计仅保留为显式 API 实验能力。当前生产前端不发送相关字段，
+# 两个开关默认均为关闭；最终结果仍由 _pick_best_candidate 的物理质量规则选出。
+try:
+    from InterGen_api.motion_planner import (
+        MotionPlan,
+        MotionPlannerError,
+        PlannerSettings,
+        compile_intergen_prompt,
+        request_motion_plan,
+    )
+    from InterGen_api.candidate_pool_audit import write_candidate_audit_manifest
+except ImportError:
+    # Direct execution from InterGen_api/ keeps that folder on sys.path.
+    from motion_planner import (
+        MotionPlan,
+        MotionPlannerError,
+        PlannerSettings,
+        compile_intergen_prompt,
+        request_motion_plan,
+    )
+    from candidate_pool_audit import write_candidate_audit_manifest
 
 from collections import OrderedDict
 from os.path import join as pjoin
@@ -148,6 +175,13 @@ class GenerateMotionRequest(BaseModel):
         description="Requested skin id from config/skin_catalog.json; defaults to smpl",
     )
     num_samples: Optional[int] = Field(default=None, ge=1, le=8, description="Number of candidates to sample before selecting best")
+    candidate_audit: bool = Field(
+        default=False,
+        description=(
+            "Retain every SMPL candidate and write a human-review audit manifest; "
+            "disabled by default and uses 8 samples when num_samples is omitted"
+        ),
+    )
     motion_frames: Optional[int] = Field(
         default=None,
         ge=180,
@@ -155,6 +189,43 @@ class GenerateMotionRequest(BaseModel):
         description="Optional motion length in frames (180-210, equal to 6-7 seconds at 30 FPS)",
     )
     cfg_weight: Optional[float] = Field(default=None, ge=1.0, le=9.0, description="Optional classifier-free guidance weight")
+    seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2147483646,
+        description="Optional replay seed; a random seed is assigned and returned when omitted",
+    )
+    experiment_group: Optional[str] = Field(
+        default=None,
+        max_length=96,
+        description="Optional experiment group used to associate baseline and planner variants",
+    )
+    experiment_variant: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional experiment variant label such as baseline, manual-plan, or planner-api",
+    )
+    translation_required: bool = Field(
+        default=False,
+        description="Fail before motion generation when a CJK prompt cannot be translated; intended for controlled experiments",
+    )
+    planner_enabled: bool = Field(
+        default=False,
+        description="Use the configured API Motion Planner before InterGen; disabled by default",
+    )
+    planner_required: bool = Field(
+        default=False,
+        description="Fail instead of falling back to the baseline prompt when planning fails",
+    )
+    planner_model: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Optional planner model override; provider and base URL remain server controlled",
+    )
+    motion_plan: Optional[MotionPlan] = Field(
+        default=None,
+        description="Optional validated manual plan for reproducible planner-vs-baseline experiments",
+    )
     retarget_enabled: bool = Field(default=False, description="Export BVH and run Blender/Rokoko retarget for person1")
     retarget_strict: bool = Field(default=False, description="Fail the task if retargeting fails")
     target_fbx: Optional[str] = Field(default=None, description="Target character FBX path")
@@ -184,6 +255,16 @@ class TranslateRequest(BaseModel):
     target_lang: str = Field(default="English", description="Translation target language")
 
 
+class CandidateReviewRequest(BaseModel):
+    mutual_facing: bool
+    racket_swing_proxy: bool
+    receiver_ready_and_reacts: bool
+    role_consistency: bool
+    badminton_semantic_match: bool
+    reviewer: str = Field(default="", max_length=96)
+    notes: str = Field(default="", max_length=2000)
+
+
 class TaskInfo(BaseModel):
     task_id: str
     status: str
@@ -195,7 +276,26 @@ class TaskInfo(BaseModel):
     person_skin_ids: List[str] = Field(default_factory=list)
     message: str = ""
     progress: int = 0
+    original_prompt: str = ""
+    translated_prompt: str = ""
+    translation_status: str = "not-started"
+    translation_error: str = ""
+    baseline_prompt: str = ""
     final_prompt: str = ""
+    seed: Optional[int] = None
+    experiment_group: str = ""
+    experiment_variant: str = "baseline"
+    planner_status: str = "disabled"
+    planner_provider: str = ""
+    planner_model: str = ""
+    planner_error: str = ""
+    motion_plan: Optional[Dict[str, object]] = None
+    selected_sample: Optional[int] = None
+    num_samples: Optional[int] = None
+    candidate_summaries: List[Dict[str, object]] = Field(default_factory=list)
+    candidate_audit: bool = False
+    candidate_audit_manifest_path: Optional[str] = None
+    experiment_manifest_path: Optional[str] = None
     output_mp4_path: Optional[str] = None
     output_bvh_path: Optional[str] = None
     output_retarget_path: Optional[str] = None
@@ -235,36 +335,31 @@ class LitGenModel(L.LightningModule):
         plot_3d_motion(result_path, paramUtil.t2m_kinematic_chain, mp_joint, title=caption, fps=30)
 
     def _resolve_window_size(self, prompt: str, motion_frames: Optional[int]) -> int:
+        del prompt
+        hard_maximum_frames = 720
         minimum_frames = _clamp_int(
             int(os.getenv("INTERGEN_MIN_MOTION_FRAMES", "180")),
             180,
-            210,
+            hard_maximum_frames,
         )
-        maximum_frames = _clamp_int(
+        configured_maximum_frames = _clamp_int(
             int(os.getenv("INTERGEN_MAX_MOTION_FRAMES", "210")),
             minimum_frames,
-            210,
+            hard_maximum_frames,
         )
+        default_frames = _clamp_int(
+            int(
+                os.getenv(
+                    "INTERGEN_DEFAULT_MOTION_FRAMES",
+                    os.getenv("INTERGEN_MOTION_FRAMES", "180"),
+                )
+            ),
+            minimum_frames,
+            hard_maximum_frames,
+        )
+        maximum_frames = max(configured_maximum_frames, default_frames)
         if motion_frames is not None:
             return _clamp_int(motion_frames, minimum_frames, maximum_frames)
-
-        default_frames = _clamp_int(
-            int(os.getenv("INTERGEN_MOTION_FRAMES", "180")),
-            minimum_frames,
-            maximum_frames,
-        )
-        motion_profile = _motion_profile(prompt)
-        if motion_profile == "boxing":
-            combat_frames = _clamp_int(
-                int(os.getenv("INTERGEN_COMBAT_MOTION_FRAMES", "210")),
-                minimum_frames,
-                maximum_frames,
-            )
-            return max(default_frames, combat_frames)
-        if motion_profile in {"short_interaction", "fencing"}:
-            return minimum_frames
-        if motion_profile in {"dance", "running"}:
-            return maximum_frames
         return default_frames
 
     def _resolve_request_cfg_weight(self, prompt: str, cfg_weight: Optional[float]) -> float:
@@ -611,6 +706,107 @@ def _utc_now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
+def _resolved_seed(seed: Optional[int]) -> int:
+    if seed is None:
+        return secrets.randbelow(2147483647)
+    return int(seed) % 2147483647
+
+
+def _set_inference_seed(seed: int) -> None:
+    seed = _resolved_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _model_dict(value) -> Optional[Dict[str, object]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    raise TypeError(f"Cannot serialize model value: {type(value).__name__}")
+
+
+def _clean_experiment_label(value: Optional[str], fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip("-.")
+    return (cleaned[:96] or fallback)
+
+
+def _write_experiment_manifest(
+    task_root: Path,
+    task_id: str,
+    req: GenerateMotionRequest,
+    prompt_context: Dict[str, object],
+    *,
+    status: str,
+    generation: Optional[Dict[str, object]] = None,
+    error: str = "",
+) -> Path:
+    task_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = task_root / "experiment_manifest.json"
+    existing: Dict[str, object] = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    seed = _resolved_seed(req.seed)
+    variant = _clean_experiment_label(
+        req.experiment_variant,
+        "manual-plan" if req.motion_plan is not None else ("planner-api" if req.planner_enabled else "baseline"),
+    )
+    group = _clean_experiment_label(req.experiment_group, task_id)
+    payload: Dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "created_at": existing.get("created_at") or _utc_now(),
+        "updated_at": _utc_now(),
+        "status": status,
+        "experiment": {
+            "group": group,
+            "variant": variant,
+            "seed": seed,
+        },
+        "prompt": prompt_context,
+        "request": {
+            "num_samples": req.num_samples,
+            "candidate_audit": bool(req.candidate_audit),
+            "motion_frames": req.motion_frames,
+            "cfg_weight": req.cfg_weight,
+            "planner_enabled": bool(req.planner_enabled),
+            "planner_required": bool(req.planner_required),
+            "translation_required": bool(req.translation_required),
+            "planner_model_override": req.planner_model or "",
+            "requested_skin_ids": list(req.skin_ids or []),
+            "person_skin_ids": [
+                value
+                for value in [req.person_a_skin_id, req.person_b_skin_id]
+                if value
+            ],
+        },
+        "runtime": {
+            "checkpoint": os.getenv("INTERGEN_FIXED_CHECKPOINT", ""),
+            "sampling_strategy": os.getenv("INTERGEN_FIXED_SAMPLING_STRATEGY", "ddim50"),
+            "candidate_selection": "physical-quality-only",
+            "semantic_critic": "unavailable",
+            "candidate_audit": "human-review-required" if req.candidate_audit else "disabled",
+        },
+        "generation": generation or {},
+        "error": _tail_text(error) if error else "",
+    }
+    temp_path = manifest_path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(manifest_path)
+    return manifest_path.resolve()
+
+
 def _tail_text(text: str, max_chars: int = 6000) -> str:
     if len(text) <= max_chars:
         return text
@@ -679,6 +875,7 @@ def _resolve_retarget_spacing(prompt: str) -> Tuple[str, float]:
 
 
 def _pick_best_candidate(candidates: list) -> dict:
+    """按渲染成功和自碰撞等物理指标选择实际生产输出，不执行语义判断。"""
     # Rank by the weaker person's post-correction result, not an aggregate that
     # can hide a poor second actor behind a clean first actor.
     def _rank(item: dict):
@@ -888,6 +1085,7 @@ def _run_intergen_retarget_if_requested(
     req: GenerateMotionRequest,
     motion_prompt: str = "",
 ) -> None:
+    """按角色选择导出双人 BVH，并在需要时调用 Blender/Rokoko 完成重定向。"""
     requested_profiles = _resolve_request_skins(req)
     person_profiles = _resolve_person_skin_profiles(req)
     person_retarget_profiles = [
@@ -1186,6 +1384,7 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> Path:
 
 
 class InterGenService:
+    """封装模型冷启动、串行推理、多样本物理选优和稳定产物写盘。"""
     def __init__(self):
         self._model = None
         self._infer_lock = threading.Lock()
@@ -1275,6 +1474,8 @@ class InterGenService:
         motion_frames: Optional[int] = None,
         cfg_weight: Optional[float] = None,
         render_preview: bool = True,
+        seed: Optional[int] = None,
+        candidate_audit: bool = False,
     ):
         if self._model is None:
             raise RuntimeError("Model not loaded")
@@ -1283,17 +1484,22 @@ class InterGenService:
         with self._infer_lock:
             with torch.no_grad():
                 default_samples = _env_int("INTERGEN_DEFAULT_NUM_SAMPLES", 5)
+                if candidate_audit and num_samples is None:
+                    default_samples = _env_int("INTERGEN_AUDIT_NUM_SAMPLES", 8)
                 prompt_l = prompt.lower()
                 if num_samples is None and any(
                     k in prompt_l for k in ["fight", "fighting", "boxing", "boxing match", "boxers"]
                 ):
                     default_samples = max(default_samples, _env_int("INTERGEN_COMBAT_NUM_SAMPLES", 2))
                 sample_count = _clamp_int(num_samples if num_samples is not None else default_samples, 1, 8)
+                replay_seed = _resolved_seed(seed)
                 candidate_dir = output_path.parent / "candidates"
                 candidate_dir.mkdir(parents=True, exist_ok=True)
 
                 candidates = []
                 for i in range(sample_count):
+                    candidate_seed = (replay_seed + i) % 2147483647
+                    _set_inference_seed(candidate_seed)
                     candidate_path = candidate_dir / f"{output_path.stem}_sample{i+1}.mp4"
                     result = self._model.generate_one_sample(
                         prompt,
@@ -1310,6 +1516,8 @@ class InterGenService:
                     candidates.append(
                         {
                             "path": candidate_path,
+                            "candidate_index": i + 1,
+                            "seed": candidate_seed,
                             "file_size": candidate_path.stat().st_size if candidate_path.exists() else 0,
                             "self_collision": collision_metrics,
                             **(result or {}),
@@ -1332,7 +1540,7 @@ class InterGenService:
                     shutil.copy2(str(src), str(dst))
                     stable_raw_files.append(str(dst.resolve()))
 
-                keep_all = os.getenv("INTERGEN_KEEP_ALL_SAMPLES", "0").strip() == "1"
+                keep_all = candidate_audit or _env_flag("INTERGEN_KEEP_ALL_SAMPLES", False)
                 if not keep_all:
                     for item in candidates:
                         p = Path(item["path"])
@@ -1340,10 +1548,32 @@ class InterGenService:
                             p.unlink()
 
                 best_idx = candidates.index(best) + 1
+                candidate_summaries = []
+                for item in candidates:
+                    candidate_summaries.append(
+                        {
+                            "candidate_index": int(item.get("candidate_index") or 0),
+                            "seed": int(item.get("seed") or 0),
+                            "file_path": str(Path(item["path"]).resolve()),
+                            "file_size": int(item.get("file_size") or 0),
+                            "generated_frames": int(item.get("generated_frames") or 0),
+                            "fps": int(item.get("fps") or 0),
+                            "raw_joints_files": [
+                                str(Path(path).resolve())
+                                for path in list(item.get("raw_joints_files") or [])
+                            ],
+                            "self_collision": dict(item.get("self_collision") or {}),
+                            "selected": item is best,
+                            "retained": Path(item["path"]).is_file(),
+                        }
+                    )
                 summary_message = f"Best-of-{sample_count} selected sample #{best_idx}."
                 merged = dict(best)
-                merged["selected_sample"] = str(best_idx)
-                merged["num_samples"] = str(sample_count)
+                merged["seed"] = replay_seed
+                merged["selected_sample"] = best_idx
+                merged["num_samples"] = sample_count
+                merged["candidate_summaries"] = candidate_summaries
+                merged["candidate_audit"] = bool(candidate_audit)
                 merged["raw_joints_files"] = stable_raw_files
                 merged["message"] = f"{best.get('message', 'Task completed')} {summary_message}".strip()
                 return merged
@@ -1504,26 +1734,29 @@ def _optimize_prompt_for_intergen(text: str) -> str:
     if not re.search(r"\b(two|2)\b", prompt_l):
         prompt = f"Two people are {prompt.rstrip('.')}"
 
+    max_words = _clamp_int(_env_int("INTERGEN_BASELINE_MAX_PROMPT_WORDS", 48), 24, 64)
     words = prompt.split()
-    if len(words) > 24:
-        prompt = " ".join(words[:24])
+    if len(words) > max_words:
+        kept = words[:max_words]
+        incomplete_tail = {"a", "an", "and", "at", "for", "from", "in", "of", "the", "to", "toward", "with"}
+        while len(kept) > 2 and kept[-1].lower().rstrip(",.;:") in incomplete_tail:
+            kept.pop()
+        prompt = " ".join(kept)
     if not prompt.endswith("."):
         prompt += "."
     return prompt
 
 
-def _translate_if_needed(text: str) -> str:
-    """
-    If the text contains Chinese characters, attempt to translate to English using DashScope.
-    If DashScope is not configured or errors occur, returns the original text to let the model try.
-    """
+def _translate_with_provenance(text: str) -> Tuple[str, str, str]:
+    """Return translated text, status, and a sanitized error description."""
     if not _contains_cjk(text):
-        return _sanitize_prompt_text(text)
+        return _sanitize_prompt_text(text), "not-needed", ""
 
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
-        print("[Translate] Dashscope API Key missing, skipping translation.")
-        return text
+        error = "DASHSCOPE_API_KEY not configured"
+        print(f"[Translate] {error}; skipping translation.")
+        return _sanitize_prompt_text(text), "skipped", error
 
     base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     try:
@@ -1543,10 +1776,20 @@ def _translate_if_needed(text: str) -> str:
         if translated:
             translated = _sanitize_prompt_text(translated)
             print(f"[Translate] {text} -> {translated}")
-            return translated
+            return translated, "succeeded", ""
+        error = "DashScope returned empty translation content"
+        print(f"[Translate] {error}")
+        return _sanitize_prompt_text(text), "failed", error
     except Exception as e:
-        print(f"[Translate] Error during translation: {e}")
-    return _sanitize_prompt_text(text)
+        error = _tail_text(str(e), max_chars=1000)
+        print(f"[Translate] Error during translation: {error}")
+        return _sanitize_prompt_text(text), "failed", error
+
+
+def _translate_if_needed(text: str) -> str:
+    """Compatibility wrapper for callers that only need translated text."""
+    translated, _, _ = _translate_with_provenance(text)
+    return translated
 
 
 def _prepare_prompt_for_model(text: str) -> str:
@@ -1556,7 +1799,85 @@ def _prepare_prompt_for_model(text: str) -> str:
     return optimized
 
 
+def _prepare_prompt_context(req: GenerateMotionRequest) -> Dict[str, object]:
+    # 【实验功能，未应用于实际生产默认逻辑链路】只有调用方显式启用时才进入规划分支；
+    # 默认请求直接使用翻译和基础提示词规范化结果，规划失败也不会改变默认生产路径。
+    original_prompt = _sanitize_prompt_text(req.text)
+    translated_prompt, translation_status, translation_error = _translate_with_provenance(req.text)
+    baseline_prompt = _optimize_prompt_for_intergen(translated_prompt)
+    final_prompt = baseline_prompt
+    plan: Optional[MotionPlan] = None
+    planner_status = "disabled"
+    planner_provider = ""
+    planner_model = req.planner_model or ""
+    planner_error = ""
+    max_prompt_words = _clamp_int(
+        _env_int("INTERGEN_MOTION_PLANNER_MAX_PROMPT_WORDS", 48),
+        24,
+        64,
+    )
+
+    if req.motion_plan is not None:
+        plan = req.motion_plan
+        planner_status = "manual"
+        planner_provider = "manual"
+        planner_model = "manual"
+        final_prompt = compile_intergen_prompt(plan, max_words=max_prompt_words)
+    elif req.planner_enabled:
+        planner_status = "requested"
+        planner_provider = os.getenv("INTERGEN_MOTION_PLANNER_PROVIDER", "dashscope").strip().lower()
+        try:
+            settings = PlannerSettings.from_env(model_override=req.planner_model)
+            planner_provider = settings.provider
+            planner_model = settings.model
+            plan = request_motion_plan(req.text, translated_prompt, settings)
+            final_prompt = compile_intergen_prompt(plan, max_words=settings.max_prompt_words)
+            planner_status = "succeeded"
+        except MotionPlannerError as exc:
+            planner_status = "failed"
+            planner_error = str(exc)
+            if req.planner_required:
+                raise
+            planner_status = "fallback"
+            print(f"[MotionPlanner] Falling back to baseline prompt: {planner_error}")
+
+    context: Dict[str, object] = {
+        "original_prompt": original_prompt,
+        "translated_prompt": translated_prompt,
+        "translation_status": translation_status,
+        "translation_error": translation_error,
+        "baseline_prompt": baseline_prompt,
+        "final_prompt": final_prompt,
+        "planner_status": planner_status,
+        "planner_provider": planner_provider,
+        "planner_model": planner_model,
+        "planner_error": planner_error,
+        "motion_plan": _model_dict(plan),
+    }
+    print(
+        "[Prompt] "
+        f"planner_status={planner_status}, baseline={baseline_prompt}, model_input={final_prompt}"
+    )
+    return context
+
+
 def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
+    """后台生成主流程：准备提示词 → InterGen → 可选预览/重定向 → 更新任务结果。"""
+    task_root = DEFAULT_TASK_ROOT / task_id
+    req.seed = _resolved_seed(req.seed)
+    prompt_context: Dict[str, object] = {
+        "original_prompt": _sanitize_prompt_text(req.text),
+        "translated_prompt": "",
+        "translation_status": "not-started",
+        "translation_error": "",
+        "baseline_prompt": "",
+        "final_prompt": "",
+        "planner_status": "not-started",
+        "planner_provider": "",
+        "planner_model": req.planner_model or "",
+        "planner_error": "",
+        "motion_plan": _model_dict(req.motion_plan),
+    }
     try:
         requested_profiles = _resolve_request_skins(req)
         requested_skin_ids = [str(profile["id"]) for profile in requested_profiles]
@@ -1569,11 +1890,49 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             for profile in requested_profiles
         )
         _update_task(task_id, status="running", message="Translating prompt...", progress=10)
-        final_prompt = _prepare_prompt_for_model(req.text)
+        prompt_context = _prepare_prompt_context(req)
+        final_prompt = str(prompt_context["final_prompt"])
+        manifest_path = _write_experiment_manifest(
+            task_root,
+            task_id,
+            req,
+            prompt_context,
+            status="prepared",
+        )
+        experiment_variant = _clean_experiment_label(
+            req.experiment_variant,
+            "manual-plan" if req.motion_plan is not None else ("planner-api" if req.planner_enabled else "baseline"),
+        )
+        experiment_group = _clean_experiment_label(req.experiment_group, task_id)
+        _update_task(
+            task_id,
+            original_prompt=str(prompt_context["original_prompt"]),
+            translated_prompt=str(prompt_context["translated_prompt"]),
+            translation_status=str(prompt_context["translation_status"]),
+            translation_error=str(prompt_context["translation_error"]),
+            baseline_prompt=str(prompt_context["baseline_prompt"]),
+            final_prompt=final_prompt,
+            seed=req.seed,
+            experiment_group=experiment_group,
+            experiment_variant=experiment_variant,
+            planner_status=str(prompt_context["planner_status"]),
+            planner_provider=str(prompt_context["planner_provider"]),
+            planner_model=str(prompt_context["planner_model"]),
+            planner_error=str(prompt_context["planner_error"]),
+            motion_plan=prompt_context.get("motion_plan"),
+            experiment_manifest_path=str(manifest_path),
+        )
+        if req.translation_required and prompt_context["translation_status"] not in {
+            "succeeded",
+            "not-needed",
+        }:
+            raise RuntimeError(
+                "Required prompt translation failed: "
+                + str(prompt_context["translation_error"] or prompt_context["translation_status"])
+            )
 
         _update_task(task_id, status="running", message="Generating motion...", progress=30)
 
-        task_root = DEFAULT_TASK_ROOT / task_id
         output_path = task_root / "output" / f"{task_id}.mp4"
 
         render_result = service.generate(
@@ -1583,6 +1942,8 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             motion_frames=req.motion_frames,
             cfg_weight=req.cfg_weight,
             render_preview=smpl_requested,
+            seed=req.seed,
+            candidate_audit=req.candidate_audit,
         )
 
         if smpl_requested and not output_path.exists():
@@ -1598,6 +1959,40 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             round(generated_frames / float(max(generated_fps, 1)), 3)
             if generated_frames is not None
             else None
+        )
+        generation_summary = {
+            "seed": int((render_result or {}).get("seed") or req.seed),
+            "selected_sample": int((render_result or {}).get("selected_sample") or 0) or None,
+            "num_samples": int((render_result or {}).get("num_samples") or 0) or None,
+            "generated_frames": generated_frames,
+            "fps": generated_fps,
+            "duration_seconds": duration_seconds,
+            "candidate_summaries": list((render_result or {}).get("candidate_summaries") or []),
+        }
+        candidate_audit_manifest_path: Optional[Path] = None
+        if req.candidate_audit:
+            candidate_audit_manifest_path = write_candidate_audit_manifest(
+                task_root / "output" / "candidate_audit.json",
+                task_id=task_id,
+                prompt=final_prompt,
+                candidate_summaries=generation_summary["candidate_summaries"],
+                selected_sample=generation_summary["selected_sample"],
+                motion_plan=prompt_context.get("motion_plan"),
+                experiment_group=experiment_group,
+                experiment_variant=experiment_variant,
+            )
+            generation_summary["candidate_audit"] = {
+                "enabled": True,
+                "status": "awaiting-human-review",
+                "manifest_path": str(candidate_audit_manifest_path),
+            }
+        manifest_path = _write_experiment_manifest(
+            task_root,
+            task_id,
+            req,
+            prompt_context,
+            status="motion-generated",
+            generation=generation_summary,
         )
 
         _run_intergen_retarget_if_requested(
@@ -1630,12 +2025,39 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
         if retarget_requested and not retarget_succeeded:
             task_message = f"{task_message} Retarget output failed; SMPL output is available."
 
+        manifest_path = _write_experiment_manifest(
+            task_root,
+            task_id,
+            req,
+            prompt_context,
+            status="succeeded",
+            generation=generation_summary,
+        )
         _update_task(
             task_id,
             status="succeeded",
             message=task_message,
             progress=100,
+            original_prompt=str(prompt_context["original_prompt"]),
+            translated_prompt=str(prompt_context["translated_prompt"]),
+            translation_status=str(prompt_context["translation_status"]),
+            translation_error=str(prompt_context["translation_error"]),
+            baseline_prompt=str(prompt_context["baseline_prompt"]),
             final_prompt=final_prompt,
+            seed=int((render_result or {}).get("seed") or req.seed),
+            planner_status=str(prompt_context["planner_status"]),
+            planner_provider=str(prompt_context["planner_provider"]),
+            planner_model=str(prompt_context["planner_model"]),
+            planner_error=str(prompt_context["planner_error"]),
+            motion_plan=prompt_context.get("motion_plan"),
+            selected_sample=int((render_result or {}).get("selected_sample") or 0) or None,
+            num_samples=int((render_result or {}).get("num_samples") or 0) or None,
+            candidate_summaries=list((render_result or {}).get("candidate_summaries") or []),
+            candidate_audit=bool(req.candidate_audit),
+            candidate_audit_manifest_path=(
+                str(candidate_audit_manifest_path) if candidate_audit_manifest_path else None
+            ),
+            experiment_manifest_path=str(manifest_path),
             output_mp4_path=str(output_path.resolve()) if smpl_requested else None,
             generated_frames=generated_frames,
             fps=generated_fps,
@@ -1643,11 +2065,33 @@ def _run_generate_task(task_id: str, req: GenerateMotionRequest) -> None:
             stderr_tail=stderr_tail,
         )
     except Exception as exc:
+        manifest_path = _write_experiment_manifest(
+            task_root,
+            task_id,
+            req,
+            prompt_context,
+            status="failed",
+            error=traceback.format_exc(),
+        )
         _update_task(
             task_id,
             status="failed",
             message=str(exc),
             progress=100,
+            seed=req.seed,
+            original_prompt=str(prompt_context.get("original_prompt") or ""),
+            translated_prompt=str(prompt_context.get("translated_prompt") or ""),
+            translation_status=str(prompt_context.get("translation_status") or "failed"),
+            translation_error=str(prompt_context.get("translation_error") or ""),
+            baseline_prompt=str(prompt_context.get("baseline_prompt") or ""),
+            final_prompt=str(prompt_context.get("final_prompt") or ""),
+            planner_status=str(prompt_context.get("planner_status") or "failed"),
+            planner_provider=str(prompt_context.get("planner_provider") or ""),
+            planner_model=str(prompt_context.get("planner_model") or ""),
+            planner_error=str(prompt_context.get("planner_error") or ""),
+            motion_plan=prompt_context.get("motion_plan"),
+            candidate_audit=bool(req.candidate_audit),
+            experiment_manifest_path=str(manifest_path),
             stderr_tail=_tail_text(traceback.format_exc()),
         )
 
@@ -1810,9 +2254,23 @@ def get_supported_skins() -> Dict[str, object]:
 @app.post("/v1/intergen/tasks/generate", response_model=TaskInfo)
 def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
     skin_profiles = _validate_request_skins(req)
+    if req.candidate_audit and not any(
+        str(profile.get("output_kind") or "") == "smpl"
+        for profile in skin_profiles
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="candidate_audit requires an SMPL preview output so every candidate can be reviewed",
+        )
     requested_skin_ids = [str(profile["id"]) for profile in skin_profiles]
     person_skin_ids = _requested_person_skin_ids(req)
     task_id = str(uuid.uuid4())
+    req.seed = _resolved_seed(req.seed)
+    experiment_variant = _clean_experiment_label(
+        req.experiment_variant,
+        "manual-plan" if req.motion_plan is not None else ("planner-api" if req.planner_enabled else "baseline"),
+    )
+    experiment_group = _clean_experiment_label(req.experiment_group, task_id)
     now = _utc_now()
     task = TaskInfo(
         task_id=task_id,
@@ -1823,6 +2281,15 @@ def create_generate_task(req: GenerateMotionRequest) -> TaskInfo:
         requested_skin_ids=requested_skin_ids,
         person_skin_ids=person_skin_ids,
         message="Task queued",
+        original_prompt=_sanitize_prompt_text(req.text),
+        translation_status=("queued" if _contains_cjk(req.text) else "not-needed"),
+        seed=req.seed,
+        experiment_group=experiment_group,
+        experiment_variant=experiment_variant,
+        planner_status=("manual" if req.motion_plan is not None else ("queued" if req.planner_enabled else "disabled")),
+        planner_model=("manual" if req.motion_plan is not None else (req.planner_model or "")),
+        motion_plan=_model_dict(req.motion_plan),
+        candidate_audit=bool(req.candidate_audit),
     )
     with _task_lock:
         _tasks[task_id] = task
@@ -1853,7 +2320,28 @@ def retry_task_retarget(task_id: str, req: RetryRetargetRequest) -> TaskInfo:
             requested_skin_ids=[str(skin_profile["id"])],
             message="Retarget retry queued",
             progress=65,
+            original_prompt=existing.original_prompt if existing else "",
+            translated_prompt=existing.translated_prompt if existing else "",
+            translation_status=existing.translation_status if existing else "not-started",
+            translation_error=existing.translation_error if existing else "",
+            baseline_prompt=existing.baseline_prompt if existing else "",
             final_prompt=existing.final_prompt if existing else "",
+            seed=existing.seed if existing else None,
+            experiment_group=existing.experiment_group if existing else "",
+            experiment_variant=existing.experiment_variant if existing else "baseline",
+            planner_status=existing.planner_status if existing else "disabled",
+            planner_provider=existing.planner_provider if existing else "",
+            planner_model=existing.planner_model if existing else "",
+            planner_error=existing.planner_error if existing else "",
+            motion_plan=existing.motion_plan if existing else None,
+            selected_sample=existing.selected_sample if existing else None,
+            num_samples=existing.num_samples if existing else None,
+            candidate_summaries=existing.candidate_summaries if existing else [],
+            candidate_audit=existing.candidate_audit if existing else False,
+            candidate_audit_manifest_path=(
+                existing.candidate_audit_manifest_path if existing else None
+            ),
+            experiment_manifest_path=existing.experiment_manifest_path if existing else None,
             output_mp4_path=str(output_path.resolve()),
             output_bvh_path=existing.output_bvh_path if existing else None,
             output_retarget_path=None,
@@ -1877,6 +2365,134 @@ def get_task(task_id: str) -> TaskInfo:
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+def _task_owned_file(task_id: str, raw_path: str) -> Path:
+    task_root = (DEFAULT_TASK_ROOT / task_id).resolve()
+    path = Path(raw_path).resolve()
+    try:
+        path.relative_to(task_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="Task artifact path escaped the task directory") from exc
+    return path
+
+
+def _candidate_audit_payload(task: TaskInfo) -> Tuple[Path, Dict[str, object]]:
+    # 【实验功能，未应用于实际生产逻辑链路】审计读取的是生成后的旁路清单，
+    # 人工审核结果不会回写 selected_sample，也不会替换已经生成的最终视频。
+    if not task.candidate_audit or not task.candidate_audit_manifest_path:
+        raise HTTPException(status_code=404, detail="Candidate audit is not enabled for this task")
+    manifest_path = _task_owned_file(task.task_id, task.candidate_audit_manifest_path)
+    if not manifest_path.is_file():
+        raise HTTPException(status_code=410, detail="Candidate audit manifest no longer exists")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Candidate audit manifest is invalid: {exc}") from exc
+    return manifest_path, payload
+
+
+@app.get("/v1/intergen/tasks/{task_id}/candidate-audit")
+def get_candidate_audit(task_id: str) -> Dict[str, object]:
+    with _task_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _, payload = _candidate_audit_payload(task)
+    return payload
+
+
+@app.post("/v1/intergen/tasks/{task_id}/candidate-audit/candidates/{candidate_index}/review")
+def review_candidate(
+    task_id: str,
+    candidate_index: int,
+    review: CandidateReviewRequest,
+) -> Dict[str, object]:
+    with _task_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    manifest_path, payload = _candidate_audit_payload(task)
+    candidates = list(payload.get("candidates") or [])
+    candidate = next(
+        (item for item in candidates if int(item.get("candidate_index") or 0) == candidate_index),
+        None,
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate not found in audit manifest")
+
+    review_fields = {
+        "mutual_facing": bool(review.mutual_facing),
+        "racket_swing_proxy": bool(review.racket_swing_proxy),
+        "receiver_ready_and_reacts": bool(review.receiver_ready_and_reacts),
+        "role_consistency": bool(review.role_consistency),
+        "badminton_semantic_match": bool(review.badminton_semantic_match),
+    }
+    candidate["human_review"] = {
+        "review_status": "completed",
+        **review_fields,
+        "semantic_pass": all(review_fields.values()),
+        "reviewer": review.reviewer.strip(),
+        "notes": review.notes.strip(),
+        "reviewed_at": _utc_now(),
+    }
+    reviewed_count = sum(
+        1
+        for item in candidates
+        if dict(item.get("human_review") or {}).get("review_status") == "completed"
+    )
+    pass_count = sum(
+        1
+        for item in candidates
+        if dict(item.get("human_review") or {}).get("semantic_pass") is True
+    )
+    summary = dict(payload.get("summary") or {})
+    summary["human_reviewed_count"] = reviewed_count
+    summary["semantic_pass_count"] = pass_count
+    if pass_count > 0:
+        summary["gate_decision"] = "candidate-qualified-by-motion-quality-evaluator"
+        payload["status"] = "candidate-found"
+    elif reviewed_count == len(candidates):
+        summary["gate_decision"] = "no-qualifying-candidate-refine-planner-or-structured-prompt"
+        payload["status"] = "no-qualifying-candidate"
+    else:
+        summary["gate_decision"] = "pending-human-review"
+        payload["status"] = "awaiting-human-review"
+    payload["summary"] = summary
+    payload["updated_at"] = _utc_now()
+    temp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(manifest_path)
+    return {
+        "task_id": task_id,
+        "candidate_index": candidate_index,
+        "human_review": candidate["human_review"],
+        "summary": summary,
+    }
+
+
+@app.get("/v1/intergen/tasks/{task_id}/candidates/{candidate_index}/download")
+def download_task_candidate(task_id: str, candidate_index: int) -> FileResponse:
+    with _task_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.candidate_audit:
+        raise HTTPException(status_code=404, detail="Candidate audit is not enabled for this task")
+    candidate = next(
+        (
+            item
+            for item in task.candidate_summaries
+            if int(item.get("candidate_index") or 0) == candidate_index
+        ),
+        None,
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    video_path = _task_owned_file(task_id, str(candidate.get("file_path") or ""))
+    if not video_path.is_file():
+        raise HTTPException(status_code=410, detail="Candidate video no longer exists")
+    return FileResponse(path=str(video_path), media_type="video/mp4", filename=video_path.name)
 
 
 def _selected_task_video_path(task: TaskInfo, skin_id: Optional[str]) -> Path:

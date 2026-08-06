@@ -1,3 +1,4 @@
+// 前端角色选择纯函数回归：验证默认单选、显式多选和六个注册角色不发生退化。
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {

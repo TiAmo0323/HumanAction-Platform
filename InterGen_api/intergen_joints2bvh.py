@@ -1,3 +1,6 @@
+# 将 InterGen 的双人 joints22 关节序列转换为 BVH。
+# 转换前会按环境开关执行上半身稳定、手/头碰撞修正、骨长恢复和质量门检查，
+# 同时输出 JSON 报告，供后续 Blender/Rokoko 重定向判断是否继续。
 import argparse
 import json
 import os
@@ -82,6 +85,7 @@ def _stabilize_upper_body_joints(
     neck_max_position_correction: float = 0.04,
     head_max_position_correction: float = 0.03,
 ) -> Tuple[np.ndarray, dict]:
+    """平滑头颈和核心关节并恢复骨长，减少重定向后的旋转突变。"""
     original = np.asarray(joints, dtype=np.float64)
     stabilized = original.copy()
     for joint in UPPER_BODY_JOINTS:
@@ -313,6 +317,7 @@ def _correct_hand_head_collisions(
     elbow_max_correction: float,
     wrist_max_correction: float,
 ) -> Tuple[np.ndarray, dict]:
+    """通过局部手臂链修正降低手腕/前臂穿过头部的风险，并记录修正统计。"""
     original = np.asarray(joints, dtype=np.float64)
     corrected = original.copy()
     head_length = _median_bone_length(original, 15, 12)
@@ -439,6 +444,7 @@ def convert_joints_to_bvh(
     hard_self_collision_ratio: float = 0.15,
     hard_self_collision_min_distance: float = 0.05,
 ) -> Path:
+    """执行完整 joints22→BVH 流程，并在旁路 JSON 中保存可审计质量报告。"""
     if str(momask_root) not in sys.path:
         sys.path.insert(0, str(momask_root))
 

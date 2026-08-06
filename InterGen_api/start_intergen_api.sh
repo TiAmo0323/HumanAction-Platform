@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# InterGen GPU 基础启动脚本（Linux/macOS）：解析外部源码和模型目录后启动异步 API。
+# 当前 Windows 生产流程使用对应 BAT；本脚本保留跨平台启动能力。
 # Configure external InterGen source/config paths for this API wrapper.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
